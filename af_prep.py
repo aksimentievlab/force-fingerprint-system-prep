@@ -6,24 +6,26 @@ Pipeline, per model (order matters):
   1. UniProt annotations: cofactors, binding sites, mature chain, covalent mods
   2. AlphaFill transplants, filtered to annotated cofactors, best copy per site
   3. Terminal trimming by mature-chain boundaries and pLDDT (UniProt numbering kept)
-  4. Dowser internal waters (optional), with cofactors present
   5. PDB2PQR + PROPKA protonation, decoded from the hydrogens PDB2PQR adds
   6. Metal-site overrides and disulfide detection
   7. psfgen build script (+ optional solvate/autoionize and NAMD extraBonds
      restraints for metal sites)
+  8. optional: buried-cavity waters by GCMC (gcmc_hydrate.py) on the solvated
+     build
 
 Anything a human should look at is flagged REVIEW in <outdir>/<model>/report.txt
 and summarised in <outdir>/summary.tsv.
 
 Requirements: python>=3.8, numpy, scipy, gemmi, requests, pdb2pqr (CLI).
-Optional: Dowser (any CLI variant), VMD (to run the generated build script).
+Optional: VMD (to run the generated build script); grand + OpenMM for --gcmc.
 
 Example:
   python af_prep.py models/AF-*.pdb --outdir prep --ph 7.0 \
       --toppar toppar/top_all36_prot.rtf toppar/toppar_water_ions.str \
                toppar/toppar_all36_prot_heme.str \
-      --dowser-cmd "dowserx {input}" --dowser-output dowserwat.pdb \
-      --solvate --run-vmd
+      --solvate --run-vmd --gcmc \
+      --gcmc-toppar toppar/top_all36_prot.rtf toppar/par_all36m_prot.prm \
+                    toppar/toppar_water_ions.str toppar/toppar_all36_prot_heme.str
 """
 import argparse
 import json
@@ -325,6 +327,7 @@ def parse_uniprot(d):
         t = f.get("type")
         if t == "Binding site" and f.get("ligand"):
             info["sites"].append({"ligand": f["ligand"].get("name"),
+                                  "label": f["ligand"].get("label") or "",
                                   "start": s, "end": e})
         elif t in ("Modified residue", "Cross-link", "Lipidation", "Glycosylation"):
             info["modified"].append({"type": t, "pos": s,
@@ -346,6 +349,8 @@ def allowed_ligands(uni, extra, rep):
         else:
             rep.review(f"UniProt cofactor '{name}' has no CCD mapping; extend "
                        "COFACTOR_NAME_TO_CCD")
+    # site_res[ccd][label] = residue numbers. UniProt labels distinguish several
+    # copies of the same ligand ("1", "2"); unlabelled features form one site.
     site_res = {}
     for s in uni["sites"]:
         ccds = NAME_TO_CCD_NORM.get(norm_name(s["ligand"]))
@@ -353,7 +358,8 @@ def allowed_ligands(uni, extra, rep):
             continue
         allowed |= set(ccds)
         for c in ccds:
-            site_res.setdefault(c, set()).update(range(s["start"], s["end"] + 1))
+            site_res.setdefault(c, {}).setdefault(s.get("label", ""), set()).update(
+                range(s["start"], s["end"] + 1))
     return allowed, expected, site_res
 
 
@@ -370,7 +376,7 @@ def get_alphafill(acc, af_id, mode, url_tmpl, cache_dir, rep):
             hits = sorted(d.glob(pat))
             if hits:
                 return hits[0]
-        rep.review(f"no AlphaFill file for {acc} in {d}")
+        rep.info(f"no AlphaFill file for {acc} in {d}")
         return None
     dest = Path(cache_dir) / f"{acc}.alphafill.cif"
     if dest.exists():
@@ -384,19 +390,26 @@ def get_alphafill(acc, af_id, mode, url_tmpl, cache_dir, rep):
         dest.write_text(r.text)
         return dest
     except Exception as exc:  # noqa: BLE001
-        rep.review(f"AlphaFill download failed ({exc}); no cofactors transplanted")
+        rep.info(f"AlphaFill download failed ({exc}); no cofactors transplanted")
         return None
 
 
 def select_ligands(protein, ligands, allowed, site_res, cfg, rep):
-    """Keep annotated ligands; one copy per site; reject clashes/overlaps."""
+    """Keep only ligands that touch a UniProt binding-site residue for that
+    ligand, at most one copy per annotated site per chain, no clashes/overlaps."""
     ph = heavy(protein)
     tree = cKDTree(coords(ph))
-    cands = []
+    chains = sorted({a.chain for a in ph})
+    cands, no_sites = [], set()
     for key, atoms in ligands.items():
         ccd = key[3]
+        tag = f"{ccd} {key[0]}{key[1]}"
         if ccd not in allowed:
-            rep.info(f"dropped {ccd} {key[0]}{key[1]} (not an annotated cofactor)")
+            rep.info(f"dropped {tag} (not an annotated cofactor)")
+            continue
+        groups = site_res.get(ccd)
+        if not groups:
+            no_sites.add(ccd)
             continue
         la = heavy(atoms) or atoms
         xyz = coords(la)
@@ -404,31 +417,64 @@ def select_ligands(protein, ligands, allowed, site_res, cfg, rep):
         metal = len(la) == 1 and la[0].element in METAL_ELEMENTS
         clashes = int(np.sum(d < (cfg.metal_clash if metal else cfg.clash)))
         near = {(ph[i].chain, ph[i].resnum)
-                for lst in tree.query_ball_point(xyz, 4.0) for i in lst}
-        if not tree.query_ball_point(xyz, 5.0, return_length=True).any():
-            rep.info(f"dropped {ccd} {key[0]}{key[1]} (only contacts trimmed residues)")
+                for lst in tree.query_ball_point(xyz, cfg.site_contact) for i in lst}
+        # contacts per annotated site, per chain (homomers: each chain has the site)
+        touched = {}
+        for (ch, rn) in near:
+            for label, res in groups.items():
+                if rn in res:
+                    touched[(ch, label)] = touched.get((ch, label), 0) + 1
+        if not touched:
+            rep.info(f"dropped {tag} (touches no annotated binding-site residue)")
             continue
-        annotated = len({r for _, r in near} & site_res.get(ccd, set()))
         cands.append(dict(key=key, ccd=ccd, atoms=atoms, xyz=xyz, metal=metal,
-                          clashes=clashes, annotated=annotated))
+                          clashes=clashes, touched=touched, tag=tag,
+                          annotated=max(touched.values())))
+    for ccd in sorted(no_sites):
+        rep.review(f"{ccd} is an annotated cofactor but UniProt gives no binding-site "
+                   "residues for it; no copy kept (place it manually if needed)")
 
-    cands.sort(key=lambda c: (c["clashes"], -c["annotated"]))
-    kept = []
+    # best-placed copies first: no clashes, then most site contacts
+    def limit(c):
+        return 0 if c["metal"] else cfg.max_clash
+    cands.sort(key=lambda c: (c["clashes"] > limit(c), -c["annotated"], c["clashes"]))
+    kept, filled, best_reject = [], set(), {}
     for c in cands:
-        tag = f"{c['ccd']} {c['key'][0]}{c['key'][1]}"
-        limit = 0 if c["metal"] else cfg.max_clash
-        if c["clashes"] > limit:
-            rep.review(f"rejected {tag}: {c['clashes']} clashing atoms")
+        site_keys = [(c["ccd"], ch, lb) for (ch, lb) in c["touched"]]
+        if c["clashes"] > limit(c):
+            for sk in site_keys:
+                best_reject.setdefault(sk, c["clashes"])
+            rep.info(f"dropped {c['tag']} ({c['clashes']} clashing atoms)")
+            continue
+        open_sites = [sk for sk in site_keys if sk not in filled]
+        if not open_sites:
+            rep.info(f"dropped {c['tag']} (site already has a better-placed copy)")
             continue
         if any(np.min(np.linalg.norm(c["xyz"][:, None] - k["xyz"][None], axis=2))
                < cfg.overlap for k in kept):
-            continue  # another copy of this site (or a competing ligand) won
-        if site_res.get(c["ccd"]) and c["annotated"] == 0:
-            rep.review(f"{tag} placed but touches none of the UniProt binding-site "
-                       "residues")
+            rep.info(f"dropped {c['tag']} (overlaps a kept ligand)")
+            continue
+        # claim the open site this copy contacts most
+        sk = max(open_sites, key=lambda k: c["touched"][(k[1], k[2])])
+        filled.add(sk)
         kept.append(c)
-        rep.info(f"kept {tag} (clashes={c['clashes']}, "
-                 f"annotated contacts={c['annotated']})")
+        label = f" site {sk[2]}" if sk[2] else ""
+        rep.info(f"kept {c['tag']} at chain {sk[1]}{label} "
+                 f"(clashes={c['clashes']}, site contacts={c['annotated']})")
+
+    # annotated sites (per chain) that ended up without a ligand
+    for ccd, groups in site_res.items():
+        if ccd not in {c["ccd"] for c in cands} and ccd not in {k[3] for k in ligands}:
+            continue  # nothing of this type was transplanted; reported elsewhere
+        for label in groups:
+            for ch in chains:
+                sk = (ccd, ch, label)
+                if sk in filled:
+                    continue
+                why = (f"best copy had {best_reject[sk]} clashing atoms"
+                       if sk in best_reject else "no transplanted copy touches it")
+                lb = f" site {label}" if label else ""
+                rep.review(f"{ccd} binding site{lb} in chain {ch} left empty ({why})")
     return kept
 
 
@@ -483,53 +529,6 @@ def trim_protein(protein, plddt, uni, cfg, rep):
         for i in keep:
             out.extend(residues[i][1])
     return out, termini
-
-
-# --------------------------------------------------------------------------
-# 4. Dowser
-# --------------------------------------------------------------------------
-
-def run_dowser(protein, ligand_atoms, workdir, cfg, rep):
-    if not cfg.dowser_cmd:
-        return []
-    wd = (Path(workdir) / "dowser").resolve()
-    wd.mkdir(exist_ok=True)
-
-    def attempt(atoms, label):
-        for f in wd.glob("*"):
-            if f.is_file():
-                f.unlink()
-        inp = wd / "dowser_in.pdb"
-        write_pdb(heavy(atoms), inp)
-        cmd = shlex.split(cfg.dowser_cmd.format(input=inp.name))
-        r = subprocess.run(cmd, cwd=wd, capture_output=True, text=True)
-        (wd / f"dowser_{label}.log").write_text(r.stdout + r.stderr)
-        out = wd / cfg.dowser_output
-        return out if out.exists() and out.stat().st_size else None
-
-    out = attempt(protein + ligand_atoms, "with_ligands")
-    if out is None and ligand_atoms:
-        rep.review("Dowser failed with cofactors present; retried protein-only "
-                   "(cofactor pockets protected only by overlap filter)")
-        out = attempt(protein, "protein_only")
-    if out is None:
-        rep.review("Dowser produced no output; no internal waters added")
-        return []
-
-    waters = [a for a in read_structure(out)
-              if is_water(a) and a.element == "O"]
-    solute = coords(heavy(protein + ligand_atoms))
-    tree = cKDTree(solute)
-    kept = []
-    for w in waters:
-        if tree.query(w.xyz)[0] < cfg.water_overlap:
-            continue
-        if any(np.linalg.norm(np.subtract(w.xyz, k.xyz)) < 2.4 for k in kept):
-            continue
-        kept.append(w)
-    rep.info(f"Dowser: {len(kept)} internal waters kept "
-             f"({len(waters) - len(kept)} removed for overlap)")
-    return kept
 
 
 # --------------------------------------------------------------------------
@@ -746,16 +745,6 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
             tcl.append(f"patch PHEM {seg(his[0])}:{his[1]} {lig_seg[id(lig)][0]}:1"
                        "  ;# VERIFY patch name/order in your heme toppar")
 
-    if waters:
-        f = bd / "water_dowser.pdb"
-        wa = [replace(w, record="HETATM", resname="TIP3", name="OH2", chain="W",
-                      resnum=i, icode="", element="O")
-              for i, w in enumerate(waters, 1)]
-        write_pdb(wa, f, "DWAT")
-        tcl += ["", "# Dowser internal waters",
-                "segment DWAT {\n    first none\n    last none\n    auto none\n"
-                f"    pdb {f.name}\n}}", f"coordpdb {f.name} DWAT"]
-
     tcl += ["", "regenerate angles dihedrals", "guesscoord",
             f"writepsf {name}.psf", f"writepdb {name}.pdb"]
     final = name
@@ -789,7 +778,7 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
                 "    set b [atomselect $m \"segname $s2 and resid $r2 and name $n2\"]",
                 f"    puts $fh \"bond [$a get index] [$b get index] {cfg.metal_k} $r0\"",
                 "    $a delete; $b delete", "}", "close $fh"]
-    tcl += ["", "exit"]
+    tcl += ["", 'puts "AFPREP_BUILD_OK"', "exit"]
     (bd / "build.tcl").write_text("\n".join(tcl) + "\n")
     return bd
 
@@ -877,8 +866,7 @@ def process(model, cfg):
     lig_atoms = [a for l in ligands for a in l["atoms"]]
     write_pdb(heavy(protein) + heavy(lig_atoms), outdir / "prepped.pdb")
 
-    # --- 4. Dowser
-    waters = run_dowser(protein, lig_atoms, outdir, cfg, rep)
+    waters = []   # internal waters are added after the build by gcmc_hydrate.py
 
     # --- 5. PDB2PQR
     p2p_atoms, pkas, p2p_disu = run_pdb2pqr(protein, waters, outdir, cfg, rep)
@@ -987,10 +975,57 @@ def process(model, cfg):
         if not (bd / f"{name}.psf").exists():
             rep.review("VMD/psfgen build did not produce a PSF; see build/vmd.log")
         elif "MOLECULE DESTROYED BY FATAL ERROR" in r.stdout or \
-                re.search(r"ERROR", r.stdout):
+                re.search(r"psfgen\) ERROR", r.stdout):
             rep.review("psfgen reported errors; see build/vmd.log")
+        elif cfg.gcmc:
+            run_gcmc(name, bd, cfg, rep)
     rep.write(outdir)
     return rep
+
+
+def run_gcmc(name, bd, cfg, rep):
+    """Internal waters by GCMC on the solvated build (gcmc_hydrate.py)."""
+    script = Path(__file__).resolve().with_name("gcmc_hydrate.py")
+    ion = f"{name}_ion"
+    if not (bd / f"{ion}.psf").exists() or not (bd / f"{ion}_box.txt").exists():
+        rep.review("GCMC skipped: solvated build or box file missing")
+        return
+    cmd = [sys.executable, str(script), "--psf", f"{ion}.psf", "--pdb", f"{ion}.pdb",
+           "--box-file", f"{ion}_box.txt", "--out", f"{name}_hyd", "--drop-nbfix",
+           "--time-budget", str(cfg.gcmc_time_budget),
+           "--toppar", *[str(Path(t).resolve()) for t in cfg.gcmc_toppar]]
+    if cfg.gcmc_platform:
+        cmd += ["--platform", cfg.gcmc_platform]
+    cmd += shlex.split(cfg.gcmc_args)
+    rep.info(f'running GCMC: {" ".join(cmd)}')
+    r = subprocess.run(cmd, cwd=bd, capture_output=True, text=True)
+    (bd / "gcmc.log").write_text(r.stdout + r.stderr)
+    summ = bd / f"{name}_hyd_gcmc_summary.json"
+    if r.returncode != 0 or not summ.exists():
+        rep.review("GCMC failed; see build/gcmc.log (unhydrated build is still usable)")
+        return
+    sm = json.loads(summ.read_text())
+    rep.data["gcmc"] = sm
+    n_in = sum(c["N_end"] for c in sm["cavities"])
+    rep.info(f"GCMC: {len(sm['cavities'])} spheres, {n_in} waters in spheres at end, "
+             f"{sm['total_seconds'] / 60:.1f} min on {sm['platform']} "
+             f"(NBFIX ignored during placement only) -> build/{name}_hyd.psf/.pdb")
+    for i, c in enumerate(sm["cavities"]):
+        if c["time_limited"]:
+            rep.review(f"GCMC sphere {i} hit the time limit after {c['moves']} of "
+                       f"{c['moves_target']} moves; occupancy may be unconverged")
+        elif c["acceptance"] == 0 and c["N_end"] == 0:
+            rep.info(f"GCMC sphere {i}: no moves accepted, left empty")
+
+
+def _run_one(m, cfg):
+    try:
+        rep = process(m, cfg)
+        n_rev = sum(1 for l, _ in rep.flags if l == "REVIEW")
+        return (Path(m).name, rep.status, n_rev)
+    except Exception as exc:  # noqa: BLE001
+        log.error("[%s] ERROR: %s", m, exc)
+        return (Path(m).name, f"ERROR: {exc}", "-")
 
 
 def main(argv=None):
@@ -1013,18 +1048,16 @@ def main(argv=None):
     p.add_argument("--clash", type=float, default=2.2)
     p.add_argument("--metal-clash", type=float, default=1.6)
     p.add_argument("--max-clash", type=int, default=2)
+    p.add_argument("--site-contact", type=float, default=4.0,
+                   help="ligand-to-binding-site-residue contact distance (A)")
     p.add_argument("--overlap", type=float, default=2.0,
                    help="ligand copies closer than this are the same site")
-    p.add_argument("--dowser-cmd", default="",
-                   help="e.g. 'dowserx {input}' (run inside a scratch dir)")
-    p.add_argument("--dowser-output", default="dowserwat.pdb")
-    p.add_argument("--water-overlap", type=float, default=2.6)
     p.add_argument("--pdb2pqr", default="pdb2pqr")
     p.add_argument("--pka-window", type=float, default=1.0)
     p.add_argument("--metal-cutoff", type=float, default=2.8)
     p.add_argument("--metal-k", type=float, default=100.0,
                    help="extraBonds force constant, kcal/mol/A^2")
-    p.add_argument("--cys-deprot-patch", default="",
+    p.add_argument("--cys-deprot-patch", default="CYSD",
                    help="patch name for deprotonated Cys in your toppar")
     p.add_argument("--ss-cutoff", type=float, default=2.5)
     p.add_argument("--ss-min", type=float, default=1.8)
@@ -1034,6 +1067,20 @@ def main(argv=None):
     p.add_argument("--salt", type=float, default=0.15)
     p.add_argument("--run-vmd", action="store_true")
     p.add_argument("--vmd", default="vmd")
+    p.add_argument("--vmd-timeout", type=float, default=3600,
+                   help="seconds before a VMD build is abandoned")
+    p.add_argument("--gcmc", action="store_true",
+                   help="fill buried cavities with gcmc_hydrate.py after the build "
+                        "(needs --solvate, --run-vmd and --gcmc-toppar)")
+    p.add_argument("--gcmc-toppar", nargs="+", default=[],
+                   help="topology AND parameter files for OpenMM")
+    p.add_argument("--gcmc-time-budget", type=float, default=30.0,
+                   help="minutes per structure for GCMC (0 = no limit)")
+    p.add_argument("--gcmc-platform", default="")
+    p.add_argument("--gcmc-args", default="",
+                   help="extra arguments passed to gcmc_hydrate.py, quoted")
+    p.add_argument("-j", "--jobs", type=int, default=1,
+                   help="models processed in parallel (several GCMC runs can share a GPU)")
     p.add_argument("-v", "--verbose", action="store_true")
     cfg = p.parse_args(argv)
     cfg.keep_ligands = {s.strip().upper() for s in cfg.keep_ligands.split(",") if s.strip()}
@@ -1042,18 +1089,19 @@ def main(argv=None):
     Path(cfg.outdir).mkdir(parents=True, exist_ok=True)
     cfg.cache = Path(cfg.cache or Path(cfg.outdir) / "cache")
     cfg.cache.mkdir(parents=True, exist_ok=True)
+    if cfg.gcmc and not (cfg.solvate and cfg.run_vmd and cfg.gcmc_toppar):
+        sys.exit("--gcmc needs --solvate, --run-vmd and --gcmc-toppar")
     if shutil.which(cfg.pdb2pqr) is None:
         sys.exit(f"pdb2pqr executable '{cfg.pdb2pqr}' not found")
 
-    rows = []
-    for m in cfg.models:
-        try:
-            rep = process(m, cfg)
-            n_rev = sum(1 for l, _ in rep.flags if l == "REVIEW")
-            rows.append((Path(m).name, rep.status, n_rev))
-        except Exception as exc:  # noqa: BLE001
-            log.error("[%s] ERROR: %s", m, exc)
-            rows.append((Path(m).name, f"ERROR: {exc}", "-"))
+    if cfg.jobs > 1:
+        # models are independent; GCMC is mostly CPU-bound, so several runs can
+        # share one GPU (each needs its own GPU memory for its context)
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=cfg.jobs) as ex:
+            rows = list(ex.map(_run_one, cfg.models, [cfg] * len(cfg.models)))
+    else:
+        rows = [_run_one(m, cfg) for m in cfg.models]
     with open(Path(cfg.outdir) / "summary.tsv", "w") as fh:
         fh.write("model\tstatus\tn_review\n")
         for r in rows:

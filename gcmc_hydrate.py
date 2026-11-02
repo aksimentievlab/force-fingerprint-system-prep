@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 gcmc_hydrate.py - fill buried cavities of a solvated CHARMM system with water by
 grand canonical Monte Carlo (grand + OpenMM). Replaces the Dowser step of
@@ -33,7 +32,6 @@ Notes:
     slightly. grand.potential.calc_mu_ex / calc_std_volume can compute exact
     values if occupancies of marginal sites matter to you.
 """
-
 import argparse
 import json
 import logging
@@ -61,7 +59,22 @@ KCAL_A2 = 418.4  # kJ/mol/nm^2 per kcal/mol/A^2
 # Loading
 # --------------------------------------------------------------------------
 
-def read_box(args, pdb_top):
+def read_pdb_coords(path):
+    """Coordinates in file order, read straight from ATOM/HETATM lines.
+    OpenMM's PDB reader groups atoms by chain/residue and ignores segment IDs, so
+    psfgen output (chain = first letter of segid) can merge distinct one-atom
+    residues such as several ZN2 segments; the PSF order is what matters here."""
+    xyz, cryst = [], None
+    with open(path) as fh:
+        for line in fh:
+            if line.startswith("CRYST1"):
+                cryst = [float(line[6:15]), float(line[15:24]), float(line[24:33])]
+            elif line.startswith(("ATOM", "HETATM")):
+                xyz.append((float(line[30:38]), float(line[38:46]), float(line[46:54])))
+    return u.Quantity(np.array(xyz) / 10.0, u.nanometer), cryst
+
+
+def read_box(args, cryst):
     if args.box:
         return [float(x) for x in args.box]
     if args.box_file:
@@ -71,8 +84,8 @@ def read_box(args, pdb_top):
         if p.suffix == ".xsc":          # step ax ay az bx by bz cx cy cz ...
             return [float(f[1]), float(f[5]), float(f[9])]
         return [float(x) for x in f[:3]]
-    if pdb_top is not None and pdb_top.getUnitCellDimensions() is not None:
-        return [x * 10 for x in pdb_top.getUnitCellDimensions().value_in_unit(u.nanometer)]
+    if cryst and min(cryst) > 1.0:
+        return cryst
     sys.exit("No box: give --box a b c, --box-file (VMD box.txt or NAMD .xsc), "
              "or a PDB with CRYST1")
 
@@ -80,19 +93,22 @@ def read_box(args, pdb_top):
 def load(args):
     psf = app.CharmmPsfFile(args.psf)
     params = app.CharmmParameterSet(*args.toppar)
-    pdb_top = None
+    cryst = None
     if args.pdb.lower().endswith(".crd"):
         pos = app.CharmmCrdFile(args.pdb).positions
     else:
-        pdb = app.PDBFile(args.pdb)
-        pos, pdb_top = pdb.positions, pdb.topology
-    box = read_box(args, pdb_top)
+        pos, cryst = read_pdb_coords(args.pdb)
+    if len(pos) != len(psf.atom_list):
+        sys.exit(f"{args.pdb} has {len(pos)} atoms but {args.psf} has "
+                 f"{len(psf.atom_list)}; they must come from the same build")
+    box = read_box(args, cryst)
     psf.setBox(box[0] * u.angstrom, box[1] * u.angstrom, box[2] * u.angstrom)
     return psf, params, pos, box
 
 
 def handle_nbfix(psf, params, drop):
-    types = {a.attype for a in psf.atom_list}
+    psf.loadParameters(params)   # PSF may store numeric types until this point
+    types = {a.type.name for a in psf.atom_list}
     pairs = set()
     for t in types:
         typ = params.atom_types_str.get(t)
@@ -109,6 +125,7 @@ def handle_nbfix(psf, params, drop):
                  "during water placement only.")
     for typ in params.atom_types_str.values():
         typ.nbfix = {}
+    params.nbfix_types.clear()
     log.warning("ignoring %d NBFIX pairs during GCMC (output PSF unaffected)", len(pairs))
     return sorted(pairs)
 
@@ -227,9 +244,88 @@ def pick_ghosts(pos_A, waters, top, solute_xyz, n):
     return [waters[i] for i in order]
 
 
+def _nm(x):
+    """Quantity/Vec3/array -> plain numpy array in nm."""
+    if hasattr(x, "value_in_unit"):
+        x = x.value_in_unit(u.nanometer)
+    return np.asarray([v for v in x] if not isinstance(x, np.ndarray) else x, dtype=float)
+
+
+def make_screened_sampler_class(grand):
+    """grand's StandardGCMCSphereSampler, but insertion attempts whose oxygen
+    lands within `screen` A of a heavy atom of a real (non-ghost) molecule are
+    rejected before any GPU work (their acceptance probability is ~exp(-40) or
+    smaller). Accepted-candidate handling is delegated to grand's own
+    insertionMove, so this works across grand versions."""
+    base = grand.samplers.StandardGCMCSphereSampler
+
+    class ScreenedGCMCSphereSampler(base):
+        def __init__(self, *a, screen=1.8, **k):
+            super().__init__(*a, **k)
+            self.screen = screen
+            self.n_screened = 0
+            self._res_atoms = [[a.index for a in r.atoms()] for r in self.topology.residues()]
+            self._is_water = [r.name == "HOH" for r in self.topology.residues()]
+            self._heavy = np.array([a.index for a in self.topology.atoms()
+                                    if a.element is not None and a.element.symbol != "H"])
+            self._tree, self._acc_at_build = None, -1
+
+        def move(self, context, n=1):
+            self._tree = None            # positions change between batches
+            return super().move(context, n)
+
+        def _overlaps(self, point):
+            box = _nm(self.simulation_box)
+            if self._tree is None or self._acc_at_build != self.n_accepted:
+                ghosts = [int(r) for r in self.getWaterStatusResids(0)]
+                if not all(0 <= r < len(self._is_water) and self._is_water[r] for r in ghosts):
+                    raise RuntimeError("grand ghost IDs do not map to water residues; "
+                                       "run with --screen 0")
+                ghost_atoms = {i for r in ghosts for i in self._res_atoms[r]}
+                real = np.array([i for i in self._heavy if i not in ghost_atoms])
+                pos = _nm(self.positions)
+                self._tree = cKDTree(np.mod(pos[real], box), boxsize=box)
+                self._acc_at_build = self.n_accepted
+            d, _ = self._tree.query(np.mod(point, box))
+            return d < self.screen / 10.0
+
+        def insertionMove(self):
+            cand = base.insertRandomWater(self)          # grand's own proposal
+            new_positions, _, atom_indices = cand
+            if self._overlaps(_nm(new_positions[atom_indices[0]])):
+                self.n_screened += 1
+                if hasattr(self, "acceptance_probabilities"):
+                    self.acceptance_probabilities.append(0.0)
+                return None
+            # evaluate this same candidate with grand's acceptance code
+            self.insertRandomWater = lambda: cand
+            try:
+                return base.insertionMove(self)
+            finally:
+                del self.insertRandomWater
+
+    return ScreenedGCMCSphereSampler
+
+
+def reset_grand_logging():
+    """grand adds a FileHandler per sampler and never removes it."""
+    lg = logging.getLogger("grand.samplers")
+    for h in list(lg.handlers):
+        lg.removeHandler(h)
+        h.close()
+    lg.propagate = False
+
+
+def n_moves_for(cav, args):
+    vol = 4.0 / 3.0 * math.pi * cav["radius"] ** 3
+    return int(min(args.max_moves, max(args.min_moves, args.move_density * vol)))
+
+
 def run(args):
+    import time
     import grand  # imported late so --help works without it
 
+    t_start = time.time()
     psf, params, pos, box = load(args)
     dropped = handle_nbfix(psf, params, args.drop_nbfix)
     top = psf.topology
@@ -239,8 +335,15 @@ def run(args):
     pos_A = np.array(pos.value_in_unit(u.angstrom))
     solute_xyz = pos_A[solute_heavy]
 
-    cavities = find_cavities(solute_xyz, args)
-    log.warning("%d buried cavities found (%d grid points)", len(cavities),
+    cavities = [] if args.manual_only else find_cavities(solute_xyz, args)
+    for sp in args.sphere or []:
+        x, y, z, r = map(float, sp)
+        cavities.append({"centre": np.array([x, y, z]), "radius": r, "points": 0,
+                         "manual": True})
+    if args.max_cavities and len(cavities) > args.max_cavities:
+        log.warning("keeping the %d largest of %d cavities", args.max_cavities, len(cavities))
+        cavities = cavities[:args.max_cavities]
+    log.warning("%d GCMC spheres (%d cavity grid points)", len(cavities),
                 sum(c["points"] for c in cavities))
     half = 0.5 * min(box)
     for c in cavities:
@@ -271,13 +374,20 @@ def run(args):
 
     outdir = Path(args.out + "_gcmc")
     outdir.mkdir(parents=True, exist_ok=True)
-    summary = {"cavities": [], "nbfix_dropped": len(dropped), "ghosts": len(ghosts)}
+    summary = {"platform": platform.getName(), "cavities": [],
+               "nbfix_dropped": len(dropped), "ghosts": len(ghosts),
+               "time_budget_min": args.time_budget}
+    budget = args.time_budget * 60 if args.time_budget else None
+    Sampler = (make_screened_sampler_class(grand) if args.screen > 0
+               else grand.samplers.StandardGCMCSphereSampler)
 
     for k, cav in enumerate(cavities):
+        t0 = time.time()
         system = make_system(psf, params, args, pos, solute_heavy)
         centre = u.Quantity(cav["centre"] / 10.0, u.nanometer)
-        sampler = grand.samplers.StandardGCMCSphereSampler(
-            system=system, topology=top, temperature=T,
+        extra = {"screen": args.screen} if args.screen > 0 else {}
+        sampler = Sampler(
+            **extra, system=system, topology=top, temperature=T,
             excessChemicalPotential=args.mu_ex * u.kilocalories_per_mole,
             standardVolume=args.std_volume * u.angstroms ** 3,
             sphereCentre=centre, sphereRadius=cav["radius"] * u.angstrom,
@@ -292,22 +402,49 @@ def run(args):
         n0 = sampler.N
         if args.fresh:
             sampler.deleteWatersInGCMCSphere()
-        for _ in range(args.cycles):
-            sampler.move(sim.context, args.moves)
-            sim.step(args.md_steps)
-        pos = sim.context.getState(getPositions=True).getPositions(asNumpy=True)
-        ghosts = [r for r, s in sampler.water_status.items() if s == 0]
-        acc = sampler.n_accepted / max(1, sampler.n_moves)
-        log.warning("cavity %d (r=%.1f A, %d pts): N %d -> %d, acceptance %.4f",
-                    k, cav["radius"], cav["points"], n0, sampler.N, acc)
-        summary["cavities"].append({"centre_A": cav["centre"].round(2).tolist(),
-                                    "radius_A": round(cav["radius"], 2),
-                                    "grid_points": cav["points"], "N_start": n0,
-                                    "N_end": sampler.N, "acceptance": acc})
-        if sampler.N > 0 and acc == 0:
-            log.warning("cavity %d: no moves accepted - increase --cycles/--moves", k)
-        del sim, sampler
+        t_setup = time.time() - t0
 
+        target = n_moves_for(cav, args)
+        cycles = max(1, math.ceil(target / args.moves))
+        # share what is left of the budget equally among the remaining cavities
+        deadline = None
+        if budget:
+            left = budget - (time.time() - t_start)
+            deadline = time.time() + max(0.0, left) / (len(cavities) - k)
+        stopped = False
+        t_mc = 0.0
+        for c in range(cycles):
+            tm = time.time()
+            sampler.move(sim.context, args.moves)
+            t_mc += time.time() - tm
+            sim.step(args.md_steps)
+            if deadline and time.time() > deadline and c < cycles - 1:
+                stopped = True
+                break
+        pos = sim.context.getState(getPositions=True).getPositions(asNumpy=True)
+        ghosts = [int(r) for r in sampler.getWaterStatusResids(0)]
+        acc = sampler.n_accepted / max(1, sampler.n_moves)
+        screened = getattr(sampler, "n_screened", 0)
+        dt = time.time() - t0
+        per_move = t_mc / max(1, sampler.n_moves)
+        log.warning("sphere %d (r=%.1f A): N %d -> %d, %d moves (%d screened), "
+                    "acceptance %.4f, %.0f s (%.1f ms/move, setup %.0f s)%s", k,
+                    cav["radius"], n0, sampler.N, sampler.n_moves, screened, acc, dt,
+                    1000 * per_move, t_setup, " - TIME LIMIT" if stopped else "")
+        summary["cavities"].append({
+            "centre_A": np.round(cav["centre"], 2).tolist(),
+            "radius_A": round(cav["radius"], 2), "grid_points": cav["points"],
+            "manual": cav.get("manual", False), "N_start": n0, "N_end": sampler.N,
+            "moves": sampler.n_moves, "moves_target": target, "acceptance": acc,
+            "screened": screened,
+            "seconds": round(dt, 1), "ms_per_move": round(1000 * per_move, 2),
+            "time_limited": stopped})
+        reset_grand_logging()
+        del sim, sampler
+        if len(ghosts) == 0:
+            log.warning("ran out of ghost waters - increase --ghosts")
+
+    summary["total_seconds"] = round(time.time() - t_start, 1)
     write_outputs(args, pos, box, ghosts, top, summary)
 
 
@@ -367,11 +504,24 @@ def main(argv=None):
     p.add_argument("--ghosts", type=int, default=0, help="0 = automatic")
     p.add_argument("--mu-ex", type=float, default=-6.09, help="kcal/mol")
     p.add_argument("--std-volume", type=float, default=30.345, help="A^3")
-    p.add_argument("--cycles", type=int, default=200)
+    p.add_argument("--move-density", type=float, default=5.0,
+                   help="GCMC moves per A^3 of sphere volume")
+    p.add_argument("--min-moves", type=int, default=1000)
+    p.add_argument("--max-moves", type=int, default=10000)
     p.add_argument("--moves", type=int, default=100, help="GCMC moves per cycle")
     p.add_argument("--md-steps", type=int, default=50, help="2 fs MD steps per cycle")
+    p.add_argument("--screen", type=float, default=1.8,
+                   help="reject insertions with O closer than this (A) to a heavy atom "
+                        "before evaluating the energy; 0 = plain grand sampler")
     p.add_argument("--fresh", action="store_true",
                    help="delete existing waters in each sphere before sampling")
+    p.add_argument("--time-budget", type=float, default=0,
+                   help="minutes per structure for all spheres (0 = no limit)")
+    p.add_argument("--max-cavities", type=int, default=0, help="largest N only")
+    p.add_argument("--sphere", nargs=4, action="append", metavar=("X", "Y", "Z", "R"),
+                   help="extra GCMC sphere (A), repeatable")
+    p.add_argument("--manual-only", action="store_true",
+                   help="use only --sphere sites, skip cavity detection")
     p.add_argument("--cavities-only", action="store_true",
                    help="only detect cavities and write them as a PDB, no GCMC")
     args = p.parse_args(argv)
