@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 """
 af_prep.py - prepare AlphaFold models for CHARMM/NAMD simulation via psfgen.
 
@@ -26,7 +25,6 @@ Example:
       --dowser-cmd "dowserx {input}" --dowser-output dowserwat.pdb \
       --solvate --run-vmd
 """
-
 import argparse
 import json
 import logging
@@ -271,6 +269,34 @@ def accession_from_name(path):
     if m:
         return m.group(1), f"AF-{m.group(1)}-F{m.group(2)}"
     return None, None
+
+
+def accession_from_header(path):
+    """UniProt accession from DBREF (PDB) or _struct_ref (mmCIF) records."""
+    path = Path(path)
+    accs = []
+    if path.suffix.lower() in (".cif", ".mmcif"):
+        import gemmi
+        block = gemmi.cif.read(str(path)).sole_block()
+        for tag in ("_struct_ref.pdbx_db_accession",
+                    "_ma_target_ref_db_details.db_accession"):
+            accs += [gemmi.cif.as_string(v) for v in block.find_values(tag)]
+    else:
+        with open(path) as fh:
+            for line in fh:
+                if line.startswith(("ATOM", "HETATM")):
+                    break
+                t = line.split()
+                if t[0] == "DBREF" and len(t) >= 7 and t[5] in ("UNP", "SWS", "TREMBL"):
+                    accs.append(t[6])
+                elif t[0] == "DBREF2" and len(t) >= 4:   # long accessions
+                    accs.append(t[3])
+                elif t[0].startswith("TITLE") and not accs:
+                    m = re.search(r"\(([A-Z0-9]{6,10})\)", line)
+                    if m:
+                        accs.append(m.group(1))
+    accs = list(dict.fromkeys(a for a in accs if a and a not in ("?", ".")))
+    return accs
 
 
 def fetch_uniprot(acc, cache_dir):
@@ -779,9 +805,18 @@ def process(model, cfg):
     outdir.mkdir(parents=True, exist_ok=True)
     rep = Report(name)
     acc, af_id = accession_from_name(model)
+    head = accession_from_header(model)
+    if len(head) > 1:
+        rep.review(f"several accessions in header {head}; using {head[0]} "
+                   "(multimer or chimera?)")
+    if head:
+        if acc and acc != head[0]:
+            rep.review(f"file name says {acc} but header says {head[0]}; using header")
+        if acc != head[0]:
+            acc, af_id = head[0], f"AF-{head[0]}-F1"
     if cfg.accession:
         acc = cfg.accession
-        af_id = af_id or acc
+        af_id = af_id or f"AF-{acc}-F1"
     rep.data["accession"] = acc
 
     # --- input model and pLDDT
@@ -796,7 +831,7 @@ def process(model, cfg):
         except Exception as exc:  # noqa: BLE001
             rep.review(f"UniProt lookup failed for {acc}: {exc}")
     elif not acc:
-        rep.review("no UniProt accession (filename not AF-<acc>-F<n>; use --accession)")
+        rep.review("no UniProt accession in header or file name (use --accession)")
     if uni:
         rep.data["uniprot"] = uni
         for m in uni["modified"]:
