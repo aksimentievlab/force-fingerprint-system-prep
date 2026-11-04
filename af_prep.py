@@ -29,6 +29,7 @@ Example:
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -403,37 +404,105 @@ def kabsch(P, Q):
     return R, qc - pc @ R.T
 
 
-def transplant_ligands(ligs, ca_af, ca_in, cfg, rep):
+SYMMETRIC_ATOMS = {"PHE": [("CD1", "CD2"), ("CE1", "CE2")],
+                   "TYR": [("CD1", "CD2"), ("CE1", "CE2")],
+                   "ASP": [("OD1", "OD2")], "GLU": [("OE1", "OE2")],
+                   "ARG": [("NH1", "NH2")]}
+
+
+def _pocket_rmsd(res_keys, af_atoms, in_atoms, R, t):
+    """Heavy-atom RMSD of the given residues after superposition, taking the
+    better of the two namings for chemically symmetric side-chain atoms."""
+    sq, n = 0.0, 0
+    for key in res_keys:
+        a = af_atoms.get(key, {})
+        b = in_atoms.get(key, {})
+        names = [nm for nm in a if nm in b and not nm.startswith("_")]
+        if not names:
+            continue
+        pa = np.array([a[nm] for nm in names]) @ R.T + t
+        best = np.sum((pa - np.array([b[nm] for nm in names])) ** 2)
+        swaps = SYMMETRIC_ATOMS.get(a["_resname"], []) if "_resname" in a else []
+        if swaps:
+            alt = {}
+            for x, y in swaps:
+                alt[x], alt[y] = y, x
+            names2 = [alt.get(nm, nm) for nm in names]
+            if all(nm in b for nm in names2):
+                best = min(best, np.sum((pa - np.array([b[nm] for nm in names2])) ** 2))
+        sq += best
+        n += len(names)
+    return math.sqrt(sq / n) if n else float("nan")
+
+
+def transplant_ligands(ligs, af_protein, protein, cfg, rep):
     """Move each AlphaFill ligand onto the input model by superposing the CA atoms
-    of residues within cfg.fit_radius of it (AlphaFill's own approach)."""
-    keys = [k for k in ca_af if k in ca_in]
+    of residues within cfg.fit_radius of it (AlphaFill's own approach), then check
+    that the pocket really is the same in both structures:
+      * backbone: local CA RMSD after the fit           (--max-fit-rmsd)
+      * side chains: heavy-atom RMSD of pocket residues (--max-pocket-rmsd)
+      * contacts: fraction of AlphaFill's ligand-protein contacts that the input
+        model reproduces                                 (--min-contact-frac)"""
+    def per_residue(atoms):
+        d = {}
+        for a in heavy(atoms):
+            r = d.setdefault((a.chain, a.resnum), {"_resname": a.resname})
+            r[a.name] = np.array(a.xyz)
+        return d
+    af_res, in_res = per_residue(af_protein), per_residue(protein)
+    keys = [k for k in af_res if "CA" in af_res[k] and k in in_res and "CA" in in_res[k]]
     if len(keys) < 3:
         rep.review("AlphaFill and input model share too few residues; ligands dropped")
         return OrderedDict(), {}
-    af_xyz = np.array([ca_af[k] for k in keys])
-    in_xyz = np.array([ca_in[k] for k in keys])
-    tree = cKDTree(af_xyz)
-    out, rmsd, poor = OrderedDict(), {}, []
+    af_ca = np.array([af_res[k]["CA"] for k in keys])
+    in_ca = np.array([in_res[k]["CA"] for k in keys])
+    ca_tree = cKDTree(af_ca)
+    af_heavy, in_heavy = heavy(af_protein), heavy(protein)
+    af_tree, in_tree = cKDTree(coords(af_heavy)), cKDTree(coords(in_heavy))
+    ident = lambda a: (a.chain, a.resnum, a.name)
+    out, metrics, poor = OrderedDict(), {}, []
     for key, atoms in ligs.items():
-        xyz = coords(atoms)
-        idx = sorted({i for lst in tree.query_ball_point(xyz, cfg.fit_radius) for i in lst})
+        tag = f"{key[3]} {key[0]}{key[1]}"
+        xyz = coords(heavy(atoms) or atoms)
+        idx = sorted({i for lst in ca_tree.query_ball_point(xyz, cfg.fit_radius) for i in lst})
         if len(idx) < 3:
-            poor.append(f"{key[3]} {key[0]}{key[1]} (no nearby residues)")
+            poor.append(f"{tag}: no nearby residues")
             continue
-        R, t = kabsch(af_xyz[idx], in_xyz[idx])
-        r = float(np.sqrt(np.mean(np.sum((af_xyz[idx] @ R.T + t - in_xyz[idx]) ** 2, 1))))
-        if r > cfg.max_fit_rmsd:
-            poor.append(f"{key[3]} {key[0]}{key[1]} (local RMSD {r:.2f} A)")
+        R, t = kabsch(af_ca[idx], in_ca[idx])
+        fit = float(np.sqrt(np.mean(np.sum((af_ca[idx] @ R.T + t - in_ca[idx]) ** 2, 1))))
+        if fit > cfg.max_fit_rmsd:
+            poor.append(f"{tag}: backbone fit {fit:.2f} A")
             continue
-        new = xyz @ R.T + t
+        new_xyz = xyz @ R.T + t
+        # pocket residues and contacts in AlphaFill's frame
+        af_near = {i for lst in af_tree.query_ball_point(xyz, cfg.contact_dist) for i in lst}
+        af_contacts = {ident(af_heavy[i]) for i in af_near}
+        # pocket = residues near the ligand in EITHER structure, so a side chain
+        # that moved into or out of the site in one of them is compared too
+        pocket = sorted({(af_heavy[i].chain, af_heavy[i].resnum) for lst in
+                         af_tree.query_ball_point(xyz, cfg.pocket_radius) for i in lst} |
+                        {(in_heavy[i].chain, in_heavy[i].resnum) for lst in
+                         in_tree.query_ball_point(new_xyz, cfg.pocket_radius) for i in lst})
+        prmsd = _pocket_rmsd(pocket, af_res, in_res, R, t)
+        if prmsd == prmsd and prmsd > cfg.max_pocket_rmsd:      # not NaN
+            poor.append(f"{tag}: pocket side chains {prmsd:.2f} A")
+            continue
+        in_contacts = {ident(in_heavy[i]) for lst in
+                       in_tree.query_ball_point(new_xyz, cfg.contact_dist) for i in lst}
+        frac = len(af_contacts & in_contacts) / len(af_contacts) if af_contacts else 1.0
+        if frac < cfg.min_contact_frac:
+            poor.append(f"{tag}: {frac:.0%} of contacts kept")
+            continue
         out[key] = [replace(a, x=float(p[0]), y=float(p[1]), z=float(p[2]))
-                    for a, p in zip(atoms, new)]
-        rmsd[key] = r
+                    for a, p in zip(heavy(atoms) or atoms, new_xyz)]
+        metrics[key] = (f"backbone fit {fit:.2f} A, pocket {prmsd:.2f} A, "
+                        f"{frac:.0%} of contacts kept")
+    cfg._transfer_drops = bool(poor)
     if poor:
-        rep.info(f"{len(poor)} AlphaFill ligand(s) not transferred - binding region "
-                 f"differs between models: {', '.join(poor[:8])}"
-                 + (" ..." if len(poor) > 8 else ""))
-    return out, rmsd
+        rep.info(f"{len(poor)} AlphaFill ligand(s) not transferred because the pocket "
+                 f"differs between models: {'; '.join(poor[:10])}"
+                 + (" ..." if len(poor) > 10 else ""))
+    return out, metrics
 
 
 def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd, cfg, rep):
@@ -522,7 +591,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd, cfg,
         kept.append(c)
         label = f" site {sk[2]}" if sk[2] else ""
         fit = fit_rmsd.get(c["key"])
-        fit = f", local fit RMSD {fit:.2f} A" if fit is not None else ""
+        fit = f", {fit}" if fit else ""
         rep.info(f"kept {c['tag']} at chain {sk[1]}{label} "
                  f"(clashes={c['clashes']}, site contacts={c['annotated']}{fit})")
 
@@ -536,7 +605,9 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd, cfg,
                 if sk in filled:
                     continue
                 why = (f"best copy had {best_reject[sk]} clashing atoms"
-                       if sk in best_reject else "no transplanted copy touches it")
+                       if sk in best_reject else "no transplanted copy touches it"
+                       + ("; some were not transferred, see INFO" if fit_rmsd is not None
+                          and getattr(cfg, "_transfer_drops", False) else ""))
                 lb = f" site {label}" if label else ""
                 rep.review(f"{ccd} binding site{lb} in chain {ch} left empty ({why})")
     return kept
@@ -1079,6 +1150,7 @@ def process(model, cfg):
     outdir = Path(cfg.outdir) / name
     outdir.mkdir(parents=True, exist_ok=True)
     rep = Report(name)
+    cfg._transfer_drops = False
     for nm, ccd in cfg.name_map.items():          # user-supplied UniProt name -> CCD
         NAME_TO_CCD_NORM[norm_name(nm)] = [ccd]
     acc, af_id = accession_from_name(model)
@@ -1147,7 +1219,7 @@ def process(model, cfg):
             if not same_len or dev > 0.5:
                 rep.info(f"AlphaFill protein differs from input model (CA RMSD {dev:.2f} A, "
                          f"same length: {same_len}); ligands moved onto the input model")
-            ligs, fit_rmsd = transplant_ligands(ligs, ca_af, ca_in, cfg, rep)
+            ligs, fit_rmsd = transplant_ligands(ligs, af_protein, protein, cfg, rep)
 
     # --- 3. trim
     protein, termini = trim_protein(protein, plddt, uni, cfg, rep)
@@ -1262,9 +1334,9 @@ def process(model, cfg):
     bd = build_files(name, outdir, prot_heavy, orig_resname, termini, states,
                      patches, ss, ligands, waters, phem, extrabonds, cfg, rep)
     if cfg.run_vmd:
-        r = subprocess.run([cfg.vmd, "-dispdev", "text"],
+        r = subprocess.run([cfg.vmd, "-dispdev", "text", "-e", "build.tcl"],
                            cwd=bd, capture_output=True, text=True,
-                           stdin=open(bd/"build.tcl"), timeout=cfg.vmd_timeout)
+                           stdin=subprocess.DEVNULL, timeout=cfg.vmd_timeout)
         (bd / "vmd.log").write_text(r.stdout + r.stderr)
         if not (bd / f"{name}.psf").exists():
             rep.review("VMD/psfgen build did not produce a PSF; see build/vmd.log")
@@ -1304,7 +1376,15 @@ def main(argv=None):
     p.add_argument("--fit-radius", type=float, default=10.0,
                    help="residues within this distance of a ligand define its local fit (A)")
     p.add_argument("--max-fit-rmsd", type=float, default=1.0,
-                   help="drop ligands whose local fit RMSD exceeds this (A)")
+                   help="drop ligands whose local backbone fit RMSD exceeds this (A)")
+    p.add_argument("--pocket-radius", type=float, default=5.0,
+                   help="residues with heavy atoms this close to a ligand form its pocket (A)")
+    p.add_argument("--max-pocket-rmsd", type=float, default=1.5,
+                   help="drop ligands whose pocket heavy-atom RMSD exceeds this (A)")
+    p.add_argument("--contact-dist", type=float, default=4.0,
+                   help="ligand-protein contact distance for --min-contact-frac (A)")
+    p.add_argument("--min-contact-frac", type=float, default=0.7,
+                   help="drop ligands keeping less than this fraction of AlphaFill's contacts")
     p.add_argument("--name-map", action="append", default=[], metavar="NAME=CCD",
                    help="map a UniProt ligand name to a CCD code, e.g. \"ATP=ATP\" "
                         "(repeatable)")
