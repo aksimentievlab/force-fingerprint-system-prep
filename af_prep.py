@@ -6,32 +6,30 @@ Pipeline, per model (order matters):
   1. UniProt annotations: cofactors, binding sites, mature chain, covalent mods
   2. AlphaFill transplants, filtered to annotated cofactors, best copy per site
   3. Terminal trimming by mature-chain boundaries and pLDDT (UniProt numbering kept)
+  4. optional: internal waters with Dowser++ (on the trimmed protein + cofactors)
   5. PDB2PQR + PROPKA protonation, decoded from the hydrogens PDB2PQR adds
   6. Metal-site overrides and disulfide detection
   7. psfgen build script (+ optional solvate/autoionize and NAMD extraBonds
      restraints for metal sites)
-  8. optional: buried-cavity waters by GCMC (gcmc_hydrate.py) on the solvated
-     build
 
 Anything a human should look at is flagged REVIEW in <outdir>/<model>/report.txt
 and summarised in <outdir>/summary.tsv.
 
 Requirements: python>=3.8, numpy, scipy, gemmi, requests, pdb2pqr (CLI).
-Optional: VMD (to run the generated build script); grand + OpenMM for --gcmc.
+Optional: VMD (to run the generated build script); Dowser++ for internal waters.
 
 Example:
   python af_prep.py models/AF-*.pdb --outdir prep --ph 7.0 \
       --toppar toppar/top_all36_prot.rtf toppar/toppar_water_ions.str \
                toppar/toppar_all36_prot_heme.str \
-      --solvate --run-vmd --gcmc \
-      --gcmc-toppar toppar/top_all36_prot.rtf toppar/par_all36m_prot.prm \
-                    toppar/toppar_water_ions.str toppar/toppar_all36_prot_heme.str
+      --solvate --run-vmd \
+      --dowser-dir /path/to/dowserplusplus --dowser-path /path/to/R/bin -j 8
 """
 import argparse
 import json
 import logging
+import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -532,6 +530,121 @@ def trim_protein(protein, plddt, uni, cfg, rep):
 
 
 # --------------------------------------------------------------------------
+# 4. Dowser++
+# --------------------------------------------------------------------------
+
+# Files Dowser++ creates while running; never copied into a per-run folder, so a
+# stale copy in the installation cannot leak into (or, with symlinks, be
+# overwritten by) a run.
+DOWSER_TEMP = re.compile(r"^(box.*\.txt|config\.txt|AllSets\.pdb|AllScores\.txt|"
+                         r"temp_PredictedWaters.*\.pdb|PredictedWaters\.pdb|"
+                         r"PredictedInternal\.pdb|data\.pdb|reform2?\.pdb|placed\.pdb|"
+                         r"refined\.pdb|sorted\.pdb|surface\.wat|new\.pdbqt|Set\d+\.pdbqt|"
+                         r"dpp\.log)$")
+
+
+def stage_dowser(src, dst, link):
+    for root, _, files in os.walk(src):
+        d = Path(dst) / os.path.relpath(root, src)
+        d.mkdir(parents=True, exist_ok=True)
+        for f in files:
+            if Path(root) == Path(src) and DOWSER_TEMP.match(f):
+                continue
+            s = Path(root) / f
+            if link:
+                (d / f).symlink_to(s.resolve())
+            else:
+                shutil.copy2(s, d / f)
+
+
+def _dowser_waters(path):
+    out = []
+    for a in read_pdb(path):
+        if is_protein(a):
+            continue
+        if a.element == "O" and (is_water(a) or a.name in ("O", "OW", "OH2")):
+            out.append(a)
+    return out
+
+
+def run_dowser(protein, lig_atoms, outdir, cfg, rep):
+    import tempfile
+    import time
+    logdir = Path(outdir).resolve() / "dowser"
+    logdir.mkdir(exist_ok=True)
+    env = dict(os.environ)
+    if cfg.dowser_path:
+        env["PATH"] = cfg.dowser_path + os.pathsep + env.get("PATH", "")
+
+    def attempt(atoms, label):
+        work = Path(tempfile.mkdtemp(prefix="dowserpp_", dir=cfg.dowser_tmp))
+        try:
+            stage_dowser(cfg.dowser_dir, work, cfg.dowser_link)
+            inp = work / "dowser_in.pdb"
+            write_pdb(heavy(atoms), inp)
+            before = {p.name for p in work.iterdir()}
+            t0 = time.time()
+            try:
+                r = subprocess.run(["bash", cfg.dowser_script, str(inp)], cwd=work,
+                                   env=env, capture_output=True, text=True,
+                                   stdin=subprocess.DEVNULL,
+                                   timeout=cfg.dowser_timeout or None)
+                log_txt, rc = r.stdout + r.stderr, r.returncode
+            except subprocess.TimeoutExpired:
+                log_txt, rc = "TIMEOUT", -1
+            (logdir / f"dowser_{label}.log").write_text(log_txt)
+            mins = (time.time() - t0) / 60
+            if "No buried cavities" in log_txt:
+                return [], mins, "none"
+            if cfg.dowser_output:
+                outs = [work / cfg.dowser_output] if (work / cfg.dowser_output).exists() else []
+            else:   # new .pdb files that contain waters
+                outs = [p for p in work.iterdir() if p.suffix == ".pdb"
+                        and p.name not in before and _dowser_waters(p)]
+            if rc != 0 or not outs:
+                return None, mins, f"exit code {rc}, no output file"
+            out = max(outs, key=lambda p: p.stat().st_mtime)
+            shutil.copy(out, logdir / out.name)
+            if len(outs) > 1:
+                rep.info(f"Dowser++ wrote several water files; used {out.name} "
+                         "(set --dowser-output to choose)")
+            return _dowser_waters(out), mins, out.name
+        finally:
+            if cfg.keep_dowser_tmp:
+                rep.info(f"Dowser++ work folder kept: {work}")
+            else:
+                shutil.rmtree(work, ignore_errors=True)
+
+    use_ligs = lig_atoms and not cfg.dowser_protein_only
+    waters, mins, what = attempt(protein + (lig_atoms if use_ligs else []),
+                                 "with_ligands" if use_ligs else "protein")
+    if waters is None and use_ligs:
+        rep.review(f"Dowser++ failed with cofactors present ({what}); retried "
+                   "protein-only")
+        waters, mins2, what = attempt(protein, "protein_only")
+        mins += mins2
+    if waters is None:
+        rep.review(f"Dowser++ failed ({what}); no internal waters - see dowser/*.log")
+        return []
+    if what == "none":
+        rep.info(f"Dowser++: no buried cavities, no internal waters ({mins:.1f} min)")
+        return []
+
+    # drop waters overlapping protein/cofactors or each other
+    tree = cKDTree(coords(heavy(protein + lig_atoms)))
+    kept = []
+    for w in waters:
+        if tree.query(w.xyz)[0] < cfg.water_overlap:
+            continue
+        if any(np.linalg.norm(np.subtract(w.xyz, k.xyz)) < 2.4 for k in kept):
+            continue
+        kept.append(w)
+    rep.info(f"Dowser++: {len(kept)} internal waters kept ({len(waters) - len(kept)} "
+             f"removed for overlap) from {what}, {mins:.1f} min")
+    return kept
+
+
+# --------------------------------------------------------------------------
 # 5. PDB2PQR protonation
 # --------------------------------------------------------------------------
 
@@ -745,17 +858,27 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
             tcl.append(f"patch PHEM {seg(his[0])}:{his[1]} {lig_seg[id(lig)][0]}:1"
                        "  ;# VERIFY patch name/order in your heme toppar")
 
+    if waters:
+        f = bd / "water_internal.pdb"
+        wa = [replace(w, record="HETATM", resname="TIP3", name="OH2", chain="W",
+                      resnum=i, icode="", element="O")
+              for i, w in enumerate(waters, 1)]
+        write_pdb(wa, f, "DWAT")
+        tcl += ["", "# Dowser++ internal waters",
+                "segment DWAT {\n    first none\n    last none\n    auto none\n"
+                f"    pdb {f.name}\n}}", f"coordpdb {f.name} DWAT"]
+
     tcl += ["", "regenerate angles dihedrals", "guesscoord",
             f"writepsf {name}.psf", f"writepdb {name}.pdb"]
     final = name
     if cfg.solvate:
         tcl += ["", "package require solvate",
-                f"solvate {name}.psf {name}.pdb -t {cfg.padding} -o {name}_solv",
+                f"solvate {name}.psf {name}.pdb -rotate -t {cfg.padding} -o {name}_solv",
                 "package require autoionize",
                 f"autoionize -psf {name}_solv.psf -pdb {name}_solv.pdb "
                 f"-sc {cfg.salt} -o {name}_ion"]
         final = f"{name}_ion"
-        tcl += ["", "# box dimensions for NAMD / gcmc_hydrate.py",
+        tcl += ["", "# box dimensions for NAMD",
                 f"set bm [mol new {final}.psf]", f"mol addfile {final}.pdb waitfor all",
                 "set mm [measure minmax [atomselect $bm all]]",
                 f"set fh [open {final}_box.txt w]",
@@ -866,7 +989,8 @@ def process(model, cfg):
     lig_atoms = [a for l in ligands for a in l["atoms"]]
     write_pdb(heavy(protein) + heavy(lig_atoms), outdir / "prepped.pdb")
 
-    waters = []   # internal waters are added after the build by gcmc_hydrate.py
+    # --- 4. Dowser++ internal waters
+    waters = run_dowser(protein, lig_atoms, outdir, cfg, rep) if cfg.dowser_dir else []
 
     # --- 5. PDB2PQR
     p2p_atoms, pkas, p2p_disu = run_pdb2pqr(protein, waters, outdir, cfg, rep)
@@ -970,52 +1094,16 @@ def process(model, cfg):
                      patches, ss, ligands, waters, phem, extrabonds, cfg, rep)
     if cfg.run_vmd:
         r = subprocess.run([cfg.vmd, "-dispdev", "text", "-e", "build.tcl"],
-                           cwd=bd, capture_output=True, text=True)
+                           cwd=bd, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL, timeout=cfg.vmd_timeout)
         (bd / "vmd.log").write_text(r.stdout + r.stderr)
         if not (bd / f"{name}.psf").exists():
             rep.review("VMD/psfgen build did not produce a PSF; see build/vmd.log")
         elif "MOLECULE DESTROYED BY FATAL ERROR" in r.stdout or \
                 re.search(r"psfgen\) ERROR", r.stdout):
             rep.review("psfgen reported errors; see build/vmd.log")
-        elif cfg.gcmc:
-            run_gcmc(name, bd, cfg, rep)
     rep.write(outdir)
     return rep
-
-
-def run_gcmc(name, bd, cfg, rep):
-    """Internal waters by GCMC on the solvated build (gcmc_hydrate.py)."""
-    script = Path(__file__).resolve().with_name("gcmc_hydrate.py")
-    ion = f"{name}_ion"
-    if not (bd / f"{ion}.psf").exists() or not (bd / f"{ion}_box.txt").exists():
-        rep.review("GCMC skipped: solvated build or box file missing")
-        return
-    cmd = [sys.executable, str(script), "--psf", f"{ion}.psf", "--pdb", f"{ion}.pdb",
-           "--box-file", f"{ion}_box.txt", "--out", f"{name}_hyd", "--drop-nbfix",
-           "--time-budget", str(cfg.gcmc_time_budget),
-           "--toppar", *[str(Path(t).resolve()) for t in cfg.gcmc_toppar]]
-    if cfg.gcmc_platform:
-        cmd += ["--platform", cfg.gcmc_platform]
-    cmd += shlex.split(cfg.gcmc_args)
-    rep.info(f'running GCMC: {" ".join(cmd)}')
-    r = subprocess.run(cmd, cwd=bd, capture_output=True, text=True)
-    (bd / "gcmc.log").write_text(r.stdout + r.stderr)
-    summ = bd / f"{name}_hyd_gcmc_summary.json"
-    if r.returncode != 0 or not summ.exists():
-        rep.review("GCMC failed; see build/gcmc.log (unhydrated build is still usable)")
-        return
-    sm = json.loads(summ.read_text())
-    rep.data["gcmc"] = sm
-    n_in = sum(c["N_end"] for c in sm["cavities"])
-    rep.info(f"GCMC: {len(sm['cavities'])} spheres, {n_in} waters in spheres at end, "
-             f"{sm['total_seconds'] / 60:.1f} min on {sm['platform']} "
-             f"(NBFIX ignored during placement only) -> build/{name}_hyd.psf/.pdb")
-    for i, c in enumerate(sm["cavities"]):
-        if c["time_limited"]:
-            rep.review(f"GCMC sphere {i} hit the time limit after {c['moves']} of "
-                       f"{c['moves_target']} moves; occupancy may be unconverged")
-        elif c["acceptance"] == 0 and c["N_end"] == 0:
-            rep.info(f"GCMC sphere {i}: no moves accepted, left empty")
 
 
 def _run_one(m, cfg):
@@ -1063,24 +1151,31 @@ def main(argv=None):
     p.add_argument("--ss-min", type=float, default=1.8)
     p.add_argument("--toppar", nargs="+", default=DEFAULT_TOPPAR)
     p.add_argument("--solvate", action="store_true")
-    p.add_argument("--padding", type=float, default=12.0)
+    p.add_argument("--padding", type=float, default=16.0)
     p.add_argument("--salt", type=float, default=0.15)
     p.add_argument("--run-vmd", action="store_true")
     p.add_argument("--vmd", default="vmd")
     p.add_argument("--vmd-timeout", type=float, default=3600,
                    help="seconds before a VMD build is abandoned")
-    p.add_argument("--gcmc", action="store_true",
-                   help="fill buried cavities with gcmc_hydrate.py after the build "
-                        "(needs --solvate, --run-vmd and --gcmc-toppar)")
-    p.add_argument("--gcmc-toppar", nargs="+", default=[],
-                   help="topology AND parameter files for OpenMM")
-    p.add_argument("--gcmc-time-budget", type=float, default=30.0,
-                   help="minutes per structure for GCMC (0 = no limit)")
-    p.add_argument("--gcmc-platform", default="")
-    p.add_argument("--gcmc-args", default="",
-                   help="extra arguments passed to gcmc_hydrate.py, quoted")
+    p.add_argument("--dowser-dir", default="",
+                   help="Dowser++ installation folder; enables internal-water placement")
+    p.add_argument("--dowser-script", default="Dowser++.sh")
+    p.add_argument("--dowser-output", default="",
+                   help="file Dowser++ writes its final waters to (default: auto-detect)")
+    p.add_argument("--dowser-link", action="store_true",
+                   help="symlink instead of copy the Dowser++ files per run (large folders)")
+    p.add_argument("--dowser-tmp", default=None,
+                   help="where per-run Dowser++ folders are created (default: system tmp)")
+    p.add_argument("--dowser-path", default="",
+                   help="directories prepended to PATH for Dowser++ (e.g. R's bin), ':'-separated")
+    p.add_argument("--dowser-timeout", type=float, default=0, help="seconds, 0 = none")
+    p.add_argument("--dowser-protein-only", action="store_true",
+                   help="give Dowser++ the protein without cofactors")
+    p.add_argument("--keep-dowser-tmp", action="store_true")
+    p.add_argument("--water-overlap", type=float, default=2.6,
+                   help="drop Dowser waters closer than this to protein/cofactor atoms (A)")
     p.add_argument("-j", "--jobs", type=int, default=1,
-                   help="models processed in parallel (several GCMC runs can share a GPU)")
+                   help="models processed in parallel (Dowser++ uses one core per model)")
     p.add_argument("-v", "--verbose", action="store_true")
     cfg = p.parse_args(argv)
     cfg.keep_ligands = {s.strip().upper() for s in cfg.keep_ligands.split(",") if s.strip()}
@@ -1089,14 +1184,17 @@ def main(argv=None):
     Path(cfg.outdir).mkdir(parents=True, exist_ok=True)
     cfg.cache = Path(cfg.cache or Path(cfg.outdir) / "cache")
     cfg.cache.mkdir(parents=True, exist_ok=True)
-    if cfg.gcmc and not (cfg.solvate and cfg.run_vmd and cfg.gcmc_toppar):
-        sys.exit("--gcmc needs --solvate, --run-vmd and --gcmc-toppar")
+    if cfg.dowser_dir:
+        d = Path(cfg.dowser_dir).resolve()
+        if not (d / cfg.dowser_script).exists():
+            sys.exit(f"{cfg.dowser_script} not found in {d}")
+        cfg.dowser_dir = d
     if shutil.which(cfg.pdb2pqr) is None:
         sys.exit(f"pdb2pqr executable '{cfg.pdb2pqr}' not found")
 
     if cfg.jobs > 1:
-        # models are independent; GCMC is mostly CPU-bound, so several runs can
-        # share one GPU (each needs its own GPU memory for its context)
+        # models are independent; each Dowser++ run uses its own copy of the
+        # Dowser++ folder, so they can run side by side (one core each)
         from concurrent.futures import ProcessPoolExecutor
         with ProcessPoolExecutor(max_workers=cfg.jobs) as ex:
             rows = list(ex.map(_run_one, cfg.models, [cfg] * len(cfg.models)))
