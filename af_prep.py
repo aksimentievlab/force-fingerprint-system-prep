@@ -4,7 +4,8 @@ af_prep.py - prepare AlphaFold models for CHARMM/NAMD simulation via psfgen.
 
 Pipeline, per model (order matters):
   1. UniProt annotations: cofactors, binding sites, mature chain, covalent mods
-  2. AlphaFill transplants, filtered to annotated cofactors, best copy per site
+  2. AlphaFill transplants, moved onto the input model by local superposition,
+     filtered to annotated binding sites, best copy per site
   3. Terminal trimming by mature-chain boundaries and pLDDT (UniProt numbering kept)
   4. optional: internal waters with Dowser++ (on the trimmed protein + cofactors)
   5. PDB2PQR + PROPKA protonation, decoded from the hydrogens PDB2PQR adds
@@ -15,7 +16,7 @@ Pipeline, per model (order matters):
 Anything a human should look at is flagged REVIEW in <outdir>/<model>/report.txt
 and summarised in <outdir>/summary.tsv.
 
-Requirements: python>=3.8, numpy, scipy, gemmi, requests, pdb2pqr (CLI).
+Requirements: python>=3.8, numpy, scipy, networkx, gemmi, requests, pdb2pqr (CLI).
 Optional: VMD (to run the generated build script); Dowser++ for internal waters.
 
 Example:
@@ -74,16 +75,14 @@ COFACTOR_NAME_TO_CCD = {
     "biotin": ["BTN"], "coenzyme A": ["COA"],
 }
 
-# CCD code -> (CHARMM residue name, {PDB atom name: CHARMM atom name}).
-# Only ligands listed here are built automatically; everything else is written
-# out and flagged NEEDS_PARAMS. VERIFY names against your toppar version.
-CHARMM_LIGANDS = {
-    "ZN": ("ZN2", {"ZN": "ZN"}),     # toppar_water_ions.str
-    "MG": ("MG", {"MG": "MG"}),
-    "CA": ("CAL", {"CA": "CAL"}),
-    "NA": ("SOD", {"NA": "SOD"}),
-    "K": ("POT", {"K": "POT"}),
-    "HEM": ("HEME", {}),             # toppar_all36_prot_heme.str; names ~match PDB
+# CCD code -> CHARMM residue names to try, in order, when they differ from the
+# CCD code (the CCD code itself is always tried too). A ligand is built when one
+# of these RESI entries exists in the --toppar files AND its heavy-atom bond
+# graph matches the transplanted ligand; atom names are mapped automatically.
+CCD_TO_CHARMM = {
+    "ZN": ["ZN2"], "CA": ["CAL"], "NA": ["SOD"], "K": ["POT"], "CL": ["CLA"],
+    "CD": ["CD2"], "HEM": ["HEME"], "NAI": ["NADH"], "NAP": ["NADP"],
+    "NDP": ["NADPH", "NDPH"], "FAD": ["FAD", "FADH"],
 }
 
 # Ligands that need bonded models / special parameters in any case.
@@ -336,7 +335,8 @@ def parse_uniprot(d):
 
 
 def allowed_ligands(uni, extra, rep):
-    """CCD codes to keep, plus binding-site residue numbers per CCD code."""
+    """CCD codes to keep, binding-site residues per CCD code, and binding-site
+    residues of UniProt ligand names that have no CCD mapping."""
     allowed = set(extra)
     expected = set()
     for name in uni["cofactors"]:
@@ -349,16 +349,17 @@ def allowed_ligands(uni, extra, rep):
                        "COFACTOR_NAME_TO_CCD")
     # site_res[ccd][label] = residue numbers. UniProt labels distinguish several
     # copies of the same ligand ("1", "2"); unlabelled features form one site.
-    site_res = {}
+    site_res, unmapped = {}, {}
     for s in uni["sites"]:
         ccds = NAME_TO_CCD_NORM.get(norm_name(s["ligand"]))
         if not ccds:
+            unmapped.setdefault(s["ligand"], set()).update(range(s["start"], s["end"] + 1))
             continue
         allowed |= set(ccds)
         for c in ccds:
             site_res.setdefault(c, {}).setdefault(s.get("label", ""), set()).update(
                 range(s["start"], s["end"] + 1))
-    return allowed, expected, site_res
+    return allowed, expected, site_res, unmapped
 
 
 # --------------------------------------------------------------------------
@@ -392,18 +393,74 @@ def get_alphafill(acc, af_id, mode, url_tmpl, cache_dir, rep):
         return None
 
 
-def select_ligands(protein, ligands, allowed, site_res, cfg, rep):
+def kabsch(P, Q):
+    """Rotation R and translation t minimising |(P @ R.T + t) - Q|."""
+    pc, qc = P.mean(0), Q.mean(0)
+    H = (P - pc).T @ (Q - qc)
+    U, _, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    R = Vt.T @ np.diag([1, 1, d]) @ U.T
+    return R, qc - pc @ R.T
+
+
+def transplant_ligands(ligs, ca_af, ca_in, cfg, rep):
+    """Move each AlphaFill ligand onto the input model by superposing the CA atoms
+    of residues within cfg.fit_radius of it (AlphaFill's own approach)."""
+    keys = [k for k in ca_af if k in ca_in]
+    if len(keys) < 3:
+        rep.review("AlphaFill and input model share too few residues; ligands dropped")
+        return OrderedDict(), {}
+    af_xyz = np.array([ca_af[k] for k in keys])
+    in_xyz = np.array([ca_in[k] for k in keys])
+    tree = cKDTree(af_xyz)
+    out, rmsd, poor = OrderedDict(), {}, []
+    for key, atoms in ligs.items():
+        xyz = coords(atoms)
+        idx = sorted({i for lst in tree.query_ball_point(xyz, cfg.fit_radius) for i in lst})
+        if len(idx) < 3:
+            poor.append(f"{key[3]} {key[0]}{key[1]} (no nearby residues)")
+            continue
+        R, t = kabsch(af_xyz[idx], in_xyz[idx])
+        r = float(np.sqrt(np.mean(np.sum((af_xyz[idx] @ R.T + t - in_xyz[idx]) ** 2, 1))))
+        if r > cfg.max_fit_rmsd:
+            poor.append(f"{key[3]} {key[0]}{key[1]} (local RMSD {r:.2f} A)")
+            continue
+        new = xyz @ R.T + t
+        out[key] = [replace(a, x=float(p[0]), y=float(p[1]), z=float(p[2]))
+                    for a, p in zip(atoms, new)]
+        rmsd[key] = r
+    if poor:
+        rep.info(f"{len(poor)} AlphaFill ligand(s) not transferred - binding region "
+                 f"differs between models: {', '.join(poor[:8])}"
+                 + (" ..." if len(poor) > 8 else ""))
+    return out, rmsd
+
+
+def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd, cfg, rep):
     """Keep only ligands that touch a UniProt binding-site residue for that
     ligand, at most one copy per annotated site per chain, no clashes/overlaps."""
+    from collections import Counter
     ph = heavy(protein)
     tree = cKDTree(coords(ph))
     chains = sorted({a.chain for a in ph})
     cands, no_sites = [], set()
+    not_in_uniprot, unmapped_hits = Counter(), {}
     for key, atoms in ligands.items():
         ccd = key[3]
         tag = f"{ccd} {key[0]}{key[1]}"
         if ccd not in allowed:
-            rep.info(f"dropped {tag} (not an annotated cofactor)")
+            # UniProt does not mention it - or mentions it under a name with no
+            # CCD mapping: check whether it sits in such a binding site
+            xyz = coords(heavy(atoms) or atoms)
+            near = {ph[i].resnum for lst in tree.query_ball_point(xyz, cfg.site_contact)
+                    for i in lst}
+            hits = [n for n, res in unmapped.items() if near & res]
+            if hits:
+                for n in hits:
+                    unmapped_hits.setdefault((n, ccd), 0)
+                    unmapped_hits[(n, ccd)] += 1
+            else:
+                not_in_uniprot[ccd] += 1
             continue
         groups = site_res.get(ccd)
         if not groups:
@@ -428,6 +485,13 @@ def select_ligands(protein, ligands, allowed, site_res, cfg, rep):
         cands.append(dict(key=key, ccd=ccd, atoms=atoms, xyz=xyz, metal=metal,
                           clashes=clashes, touched=touched, tag=tag,
                           annotated=max(touched.values())))
+    if not_in_uniprot:
+        rep.info("dropped AlphaFill ligands not mentioned in UniProt: " +
+                 ", ".join(f"{c} x{n}" for c, n in not_in_uniprot.most_common()))
+    for (name, ccd), n in sorted(unmapped_hits.items()):
+        rep.review(f"{n} AlphaFill {ccd} copy(ies) sit in the UniProt binding site for "
+                   f"'{name}', which has no CCD mapping - to keep them, run with "
+                   f"--name-map \"{name}={ccd}\" (or add it to COFACTOR_NAME_TO_CCD)")
     for ccd in sorted(no_sites):
         rep.review(f"{ccd} is an annotated cofactor but UniProt gives no binding-site "
                    "residues for it; no copy kept (place it manually if needed)")
@@ -457,8 +521,10 @@ def select_ligands(protein, ligands, allowed, site_res, cfg, rep):
         filled.add(sk)
         kept.append(c)
         label = f" site {sk[2]}" if sk[2] else ""
+        fit = fit_rmsd.get(c["key"])
+        fit = f", local fit RMSD {fit:.2f} A" if fit is not None else ""
         rep.info(f"kept {c['tag']} at chain {sk[1]}{label} "
-                 f"(clashes={c['clashes']}, site contacts={c['annotated']})")
+                 f"(clashes={c['clashes']}, site contacts={c['annotated']}{fit})")
 
     # annotated sites (per chain) that ended up without a ligand
     for ccd, groups in site_res.items():
@@ -770,6 +836,101 @@ def find_disulfides(prot_heavy, exclude, cfg):
 # 7. Build files
 # --------------------------------------------------------------------------
 
+MASS_TO_ELEMENT = [(1.008, "H"), (10.81, "B"), (12.011, "C"), (14.007, "N"),
+                   (15.999, "O"), (18.998, "F"), (22.99, "NA"), (24.305, "MG"),
+                   (30.974, "P"), (32.06, "S"), (35.45, "CL"), (39.098, "K"),
+                   (40.078, "CA"), (54.938, "MN"), (55.845, "FE"), (58.933, "CO"),
+                   (58.693, "NI"), (63.546, "CU"), (65.38, "ZN"), (78.97, "SE"),
+                   (79.904, "BR"), (112.41, "CD"), (126.9, "I")]
+COVALENT_R = {"H": 0.31, "C": 0.76, "N": 0.71, "O": 0.66, "F": 0.57, "P": 1.07,
+              "S": 1.05, "CL": 1.02, "BR": 1.20, "I": 1.39, "SE": 1.20, "B": 0.84,
+              "FE": 1.32, "MG": 1.41, "ZN": 1.22, "CU": 1.32, "MN": 1.39, "CO": 1.26,
+              "NI": 1.24}
+_RTF_CACHE = {}
+
+
+def load_rtf(paths):
+    """{RESI name: (atom names, elements, heavy-atom bonds)} from topology/stream files."""
+    key = tuple(str(p) for p in paths)
+    if key in _RTF_CACHE:
+        return _RTF_CACHE[key]
+    texts = [Path(p).read_text(errors="replace") for p in paths if Path(p).exists()]
+    type_el = {}
+    for txt in texts:
+        for line in txt.splitlines():
+            t = line.split("!")[0].split()
+            if len(t) >= 4 and t[0].upper() == "MASS":
+                if len(t) >= 5 and t[4].isalpha():
+                    type_el[t[2].upper()] = t[4].upper()
+                else:
+                    m = float(t[3])
+                    type_el[t[2].upper()] = min(MASS_TO_ELEMENT, key=lambda e: abs(e[0] - m))[1]
+    res, cur = {}, None
+    for txt in texts:
+        for line in txt.splitlines():
+            t = line.split("!")[0].split()
+            if not t:
+                continue
+            kw = t[0].upper()[:4]
+            if kw in ("RESI", "PRES"):
+                cur = None
+                if kw == "RESI" and len(t) > 1:
+                    cur = res.setdefault(t[1].upper(), {"atoms": [], "el": {}, "bonds": set()})
+            elif kw == "END":
+                cur = None
+            elif cur is not None and kw == "ATOM" and len(t) >= 3:
+                name = t[1].upper()
+                cur["atoms"].append(name)
+                cur["el"][name] = type_el.get(t[2].upper(), re.sub(r"[^A-Z]", "", name)[:1])
+            elif cur is not None and kw in ("BOND", "DOUB", "TRIP", "AROM"):
+                names = [x.upper() for x in t[1:]]
+                for a, b in zip(names[::2], names[1::2]):
+                    if a[0] not in "+-" and b[0] not in "+-":
+                        cur["bonds"].add((a, b))
+    _RTF_CACHE[key] = res
+    return res
+
+
+def charmm_ligand(atoms, ccd, toppar):
+    """Find a CHARMM RESI matching this ligand's heavy-atom graph.
+    Returns (resname, {pdb atom name: charmm atom name}, message)."""
+    import networkx as nx
+    from networkx.algorithms import isomorphism
+    rtf = load_rtf(toppar)
+    la = heavy(atoms) or atoms
+    g = nx.Graph()
+    for i, a in enumerate(la):
+        g.add_node(i, el=a.element.upper())
+    xyz = coords(la)
+    for i in range(len(la)):
+        for j in range(i + 1, len(la)):
+            ri = COVALENT_R.get(la[i].element.upper(), 0.8)
+            rj = COVALENT_R.get(la[j].element.upper(), 0.8)
+            if np.linalg.norm(xyz[i] - xyz[j]) < ri + rj + 0.45:
+                g.add_edge(i, j)
+    tried = []
+    for name in dict.fromkeys(CCD_TO_CHARMM.get(ccd, []) + [ccd]):
+        r = rtf.get(name)
+        if r is None:
+            continue
+        hv = [a for a in r["atoms"] if r["el"].get(a) != "H"]
+        h = nx.Graph()
+        for a in hv:
+            h.add_node(a, el=r["el"].get(a, "X").upper())
+        for a, b in r["bonds"]:
+            if a in h and b in h:
+                h.add_edge(a, b)
+        tried.append(f"{name} ({len(hv)} heavy atoms vs {len(la)})")
+        if len(hv) != len(la):
+            continue
+        gm = isomorphism.GraphMatcher(g, h, node_match=lambda x, y: x["el"] == y["el"])
+        if gm.is_isomorphic():
+            return name, {la[i].name: gm.mapping[i] for i in gm.mapping}, ""
+    if not tried:
+        return None, {}, "no matching RESI in the --toppar files"
+    return None, {}, "heavy-atom graph does not match " + ", ".join(tried)
+
+
 def normalize_cterm(atoms, patch):
     names = {a.name for a in atoms}
     out = []
@@ -836,8 +997,9 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
         sid = f"HT{k:02d}"
         ccd = lig["ccd"]
         f = bd / f"lig_{k:02d}_{ccd}.pdb"
-        if ccd in CHARMM_LIGANDS and ccd not in NEEDS_BONDED:
-            rname, amap = CHARMM_LIGANDS[ccd]
+        rname, amap, why = (None, {}, "needs a bonded model / dedicated parameters") \
+            if ccd in NEEDS_BONDED else charmm_ligand(lig["atoms"], ccd, cfg.toppar)
+        if rname:
             la = [replace(a, record="HETATM", resname=rname, chain="X", resnum=1,
                           icode="", name=amap.get(a.name, a.name))
                   for a in heavy(lig["atoms"])]
@@ -845,12 +1007,13 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
             auto = "    auto none\n" if len(la) == 1 else ""
             tcl += [f"segment {sid} {{\n    first none\n    last none\n{auto}"
                     f"    pdb {f.name}\n}}", f"coordpdb {f.name} {sid}"]
-            lig_seg[id(lig)] = (sid, la)
+            lig_seg[id(lig)] = (sid, la, amap)
+            rep.info(f"{ccd} built as CHARMM residue {rname} (segment {sid})")
         else:
             write_pdb(heavy(lig["atoms"]), f, sid)
-            rep.review(f"{ccd}: no automatic CHARMM parameters - written to "
-                       f"build/{f.name}, NOT built (CHARMM-GUI Ligand Reader / "
-                       "CGenFF, or a bonded model for metal clusters)")
+            rep.review(f"{ccd} NOT built ({why}) - written to build/{f.name}; add its "
+                       "topology to --toppar (CHARMM-GUI Ligand Reader / CGenFF) or a "
+                       "name to CCD_TO_CHARMM")
             tcl += [f"# NEEDS_PARAMS: {ccd} in {f.name} (segment {sid}) not built"]
 
     for his, lig in phem:
@@ -873,7 +1036,7 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
     final = name
     if cfg.solvate:
         tcl += ["", "package require solvate",
-                f"solvate {name}.psf {name}.pdb -rotate -t {cfg.padding} -o {name}_solv",
+                f"solvate {name}.psf {name}.pdb -t {cfg.padding} -o {name}_solv",
                 "package require autoionize",
                 f"autoionize -psf {name}_solv.psf -pdb {name}_solv.pdb "
                 f"-sc {cfg.salt} -o {name}_ion"]
@@ -889,8 +1052,8 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
     for lig, m, p, d in extrabonds:
         if id(lig) not in lig_seg:
             continue
-        sid, la = lig_seg[id(lig)]
-        mname = CHARMM_LIGANDS[lig["ccd"]][1].get(m.name, m.name)
+        sid, la, amap = lig_seg[id(lig)]
+        mname = amap.get(m.name, m.name)
         eb.append((sid, 1, mname, seg(p.chain), p.resnum, p.name, f"{d:.3f}"))
     if eb:
         tcl += ["", "# NAMD extraBonds restraints for metal coordination",
@@ -916,6 +1079,8 @@ def process(model, cfg):
     outdir = Path(cfg.outdir) / name
     outdir.mkdir(parents=True, exist_ok=True)
     rep = Report(name)
+    for nm, ccd in cfg.name_map.items():          # user-supplied UniProt name -> CCD
+        NAME_TO_CCD_NORM[norm_name(nm)] = [ccd]
     acc, af_id = accession_from_name(model)
     head = accession_from_header(model)
     if len(head) > 1:
@@ -952,35 +1117,45 @@ def process(model, cfg):
                            f"{m['desc']} - needs a custom patch")
             elif m["type"] == "Glycosylation":
                 rep.info(f"glycosylation at {m['pos']}: {m['desc']} (not modelled)")
-    allowed, expected, site_res = (allowed_ligands(uni, cfg.keep_ligands, rep)
-                                   if uni else (set(cfg.keep_ligands), set(), {}))
+    allowed, expected, site_res, unmapped = (
+        allowed_ligands(uni, cfg.keep_ligands, rep) if uni
+        else (set(cfg.keep_ligands), set(), {}, {}))
 
-    # --- 2. AlphaFill: use its protein coordinates if available
+    # --- 2. AlphaFill
     af_file = get_alphafill(acc, af_id, cfg.alphafill, cfg.alphafill_url, cfg.cache, rep)
     src = read_structure(af_file) if af_file else inp
-    protein = [a for a in src if is_protein(a) and a.record == "ATOM"]
+    af_protein = [a for a in src if is_protein(a) and a.record == "ATOM"]
     ligs = OrderedDict((k, v) for k, v in group_residues(
         [a for a in src if not is_protein(a) and not is_water(a)]).items())
+    fit_rmsd = {}
+    protein = [a for a in inp if is_protein(a) and a.record == "ATOM"]
     if af_file:
         ca_in = {(a.chain, a.resnum): a.xyz for a in inp if a.name == "CA"}
-        ca_af = {(a.chain, a.resnum): a.xyz for a in protein if a.name == "CA"}
+        ca_af = {(a.chain, a.resnum): a.xyz for a in af_protein if a.name == "CA"}
         common = sorted(set(ca_in) & set(ca_af))
-        if len(common) != len(ca_in) or len(common) != len(ca_af):
-            rep.review("AlphaFill protein differs in length from input model "
-                       "(different AF DB version?); AlphaFill coordinates used")
-        elif common:
-            dev = np.sqrt(np.mean(np.sum((np.array([ca_in[k] for k in common]) -
-                                          np.array([ca_af[k] for k in common])) ** 2, 1)))
-            if dev > 0.5:
-                rep.review(f"AlphaFill protein deviates {dev:.2f} A from input "
-                           "model (different AF version?); AlphaFill coordinates used")
+        dev = (np.sqrt(np.mean(np.sum((np.array([ca_in[k] for k in common]) -
+                                       np.array([ca_af[k] for k in common])) ** 2, 1)))
+               if common else float("nan"))
+        same_len = len(common) == len(ca_in) == len(ca_af)
+        rep.data["alphafill_vs_model_ca_rmsd"] = round(float(dev), 2)
+        if cfg.alphafill_coords == "alphafill":
+            protein = af_protein
+            if not same_len or dev > 0.5:
+                rep.review(f"AlphaFill protein differs from input model (CA RMSD "
+                           f"{dev:.2f} A, same length: {same_len}); AlphaFill coordinates used")
+        else:
+            if not same_len or dev > 0.5:
+                rep.info(f"AlphaFill protein differs from input model (CA RMSD {dev:.2f} A, "
+                         f"same length: {same_len}); ligands moved onto the input model")
+            ligs, fit_rmsd = transplant_ligands(ligs, ca_af, ca_in, cfg, rep)
 
     # --- 3. trim
     protein, termini = trim_protein(protein, plddt, uni, cfg, rep)
     orig_resname = {(a.chain, a.resnum): ("HIS" if a.resname in ("HSD", "HSE", "HSP")
                                           else a.resname) for a in protein}
 
-    ligands = select_ligands(protein, ligs, allowed, site_res, cfg, rep) if ligs else []
+    ligands = (select_ligands(protein, ligs, allowed, site_res, unmapped, fit_rmsd, cfg, rep)
+               if ligs else [])
     found = {l["ccd"] for l in ligands}
     for ccds in expected:
         if not found & set(ccds):
@@ -1042,12 +1217,6 @@ def process(model, cfg):
             rep.info(f"HIS {key[0]}{key[1]}: {states.get(key)} -> {new} "
                      "(metal coordination)")
         states[key] = new
-    for lig in ligands:
-        if lig["ccd"] in NEEDS_BONDED:
-            rep.review(f"{lig['ccd']} needs a bonded model / dedicated parameters")
-        elif any(a.element in METAL_ELEMENTS for a in lig["atoms"]) \
-                and lig["ccd"] not in CHARMM_LIGANDS:
-            rep.review(f"metal {lig['ccd']} has no CHARMM mapping")
     if extrabonds:
         rep.info(f"{len(extrabonds)} metal-ligand contacts -> extraBonds restraints")
 
@@ -1093,9 +1262,9 @@ def process(model, cfg):
     bd = build_files(name, outdir, prot_heavy, orig_resname, termini, states,
                      patches, ss, ligands, waters, phem, extrabonds, cfg, rep)
     if cfg.run_vmd:
-        r = subprocess.run([cfg.vmd, "-dispdev", "text", "-e", "build.tcl"],
+        r = subprocess.run([cfg.vmd, "-dispdev", "text"],
                            cwd=bd, capture_output=True, text=True,
-                           stdin=subprocess.DEVNULL, timeout=cfg.vmd_timeout)
+                           stdin=open(bd/"build.tcl"), timeout=cfg.vmd_timeout)
         (bd / "vmd.log").write_text(r.stdout + r.stderr)
         if not (bd / f"{name}.psf").exists():
             rep.review("VMD/psfgen build did not produce a PSF; see build/vmd.log")
@@ -1129,6 +1298,16 @@ def main(argv=None):
     p.add_argument("--alphafill", default="auto",
                    help="'auto' (download), a directory of AlphaFill .cif files, or 'none'")
     p.add_argument("--alphafill-url", default=ALPHAFILL_URL)
+    p.add_argument("--alphafill-coords", choices=("model", "alphafill"), default="model",
+                   help="'model': keep the input structure and move AlphaFill ligands onto "
+                        "it by local superposition; 'alphafill': use AlphaFill's protein")
+    p.add_argument("--fit-radius", type=float, default=10.0,
+                   help="residues within this distance of a ligand define its local fit (A)")
+    p.add_argument("--max-fit-rmsd", type=float, default=1.0,
+                   help="drop ligands whose local fit RMSD exceeds this (A)")
+    p.add_argument("--name-map", action="append", default=[], metavar="NAME=CCD",
+                   help="map a UniProt ligand name to a CCD code, e.g. \"ATP=ATP\" "
+                        "(repeatable)")
     p.add_argument("--keep-ligands", default="",
                    help="extra CCD codes to keep, comma-separated (e.g. ATP,ADP)")
     p.add_argument("--plddt", type=float, default=50.0, help="terminal trim threshold")
@@ -1151,7 +1330,7 @@ def main(argv=None):
     p.add_argument("--ss-min", type=float, default=1.8)
     p.add_argument("--toppar", nargs="+", default=DEFAULT_TOPPAR)
     p.add_argument("--solvate", action="store_true")
-    p.add_argument("--padding", type=float, default=16.0)
+    p.add_argument("--padding", type=float, default=12.0)
     p.add_argument("--salt", type=float, default=0.15)
     p.add_argument("--run-vmd", action="store_true")
     p.add_argument("--vmd", default="vmd")
@@ -1179,6 +1358,11 @@ def main(argv=None):
     p.add_argument("-v", "--verbose", action="store_true")
     cfg = p.parse_args(argv)
     cfg.keep_ligands = {s.strip().upper() for s in cfg.keep_ligands.split(",") if s.strip()}
+    try:
+        cfg.name_map = dict((k.strip(), v.strip().upper()) for k, v in
+                            (m.rsplit("=", 1) for m in cfg.name_map))
+    except ValueError:
+        sys.exit("--name-map expects NAME=CCD")
     logging.basicConfig(level=logging.INFO if cfg.verbose else logging.WARNING,
                         format="%(levelname)s %(message)s")
     Path(cfg.outdir).mkdir(parents=True, exist_ok=True)

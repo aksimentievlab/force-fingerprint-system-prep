@@ -12,6 +12,7 @@ dependencies = [
     "pdb2pqr>=3.6.2",
     "gemmi>=0.7.5",
     "scipy>=1.13.1",
+    "networkx>=3.2.1",
 ]
 
 [tool.uv]
