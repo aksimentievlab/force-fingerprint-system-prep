@@ -75,6 +75,22 @@ COFACTOR_NAME_TO_CCD = {
     "[4Fe-4S] cluster": ["SF4"], "[2Fe-2S] cluster": ["FES"],
     "[3Fe-4S] cluster": ["F3S"], "Mo-molybdopterin": ["MTE"],
     "biotin": ["BTN"], "coenzyme A": ["COA"],
+    # cofactors seen in the dataset
+    "chloride": ["CL"],                                   # CHARMM: CLA
+    "a divalent metal cation": ["MG", "MN", "ZN", "CO", "NI", "FE2", "CA", "CU"],
+    "O2": ["OXY"],                                        # CHARMM: O2
+    "ATP": ["ATP"],                                       # CHARMM: ATP
+    "S-adenosyl-L-methionine": ["SAM"],                   # CHARMM: SAM
+    "S-adenosyl-L-homocysteine": ["SAH"],                 # CHARMM: SAH
+    "(6S)-5,6,7,8-tetrahydrofolate": ["THG"],             # CHARMM: THG
+    "CoA": ["COA"],
+    "acetyl-CoA": ["ACO"],
+    "glutathione": ["GSH"],
+    "L-ascorbate": ["ASC"],
+    "(R)-lipoate": ["LPA"],
+    "cob(II)alamin": ["B12"],
+    "(6R)-5,10-methylene-5,6,7,8-tetrahydrofolate": ["MHF"],   # verify, see below
+    "hybrid [4Fe-2O-2S] cluster": ["FSO"],                     # verify, see below
 }
 
 # PDB-code -> CHARMM aliases and UniProt state -> CHARMM residue come from the
