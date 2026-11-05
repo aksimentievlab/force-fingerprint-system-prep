@@ -50,6 +50,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.request
+import json
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -116,14 +117,20 @@ BUNDLED_CUFIX = "non_charmm/toppar_ions_nbfix_uiuc.str"   # Yoo & Aksimentiev, 2
 
 # PDB chemical-component codes whose CHARMM residue has a different name.
 CCD_ALIASES = {
-    "HOH": "TIP3", "NA": "SOD", "K": "POT", "CL": "CLA", "CA": "CAL", "LI": "LIT",
-    "RB": "RUB", "CS": "CES", "BA": "BAR", "ZN": "ZN2", "CD": "CD2", "MG": "MG",
-    "HEM": "HEME", "FE2": "FE2P", "FE": "FE3P", "CU1": "CU1P", "CU": "CU2P",
-    "MN": "MN2P", "CO": "CO2P", "NI": "NI2P", "SR": "SR2P", "HG": "HG2P",
-    "PB": "PB2P", "AL": "AL3P", "LA": "LA3P", "GD3": "GD3P", "EU3": "EU3P",
-    "YT3": "Y3P",
+    # water and ions (toppar_water_ions)
+    "HOH": ["TIP3"], "NA": ["SOD"], "K": ["POT"], "CL": ["CLA"], "CA": ["CAL"],
+    "LI": ["LIT"], "RB": ["RUB"], "CS": ["CES"], "BA": ["BAR"],
+    "ZN": ["ZN2"], "CD": ["CD2"],
+    # metal ions (toppar_ions_won) -- all present in your toppar
+    "FE2": ["FE2P"], "FE": ["FE3P"], "CU1": ["CU1P"], "CU": ["CU2P"], "MN": ["MN2P"],
+    "CO": ["CO2P"], "NI": ["NI2P"], "SR": ["SR2P"], "HG": ["HG2P"], "PB": ["PB2P"],
+    "AL": ["AL3P"], "LA": ["LA3P"], "GD3": ["GD3P"], "EU3": ["EU3P"], "YT3": ["Y3P"],
+    # cofactors whose CHARMM name differs from the PDB code
+    "HEM": ["HEME"],
+    "RET": ["RTAL"], "RTL": ["RTOL"],      # retinal, retinol
+    "FDA": ["FADR"], "FNR": ["FMNR"],      # fully reduced FAD / FMN
+    "CMO": ["CO"], "OXY": ["O2"],          # heme ligands: carbon monoxide, O2
 }
-
 CTRL_NOOPS = {"BOMLEV", "BOMB", "WRNLEV", "WRNL", "PRNLEV", "PRNL", "ECHO",
               "IOFORMAT", "IOFO", "FASTER", "LABEL", "TIMER"}
 
@@ -731,6 +738,8 @@ def main(argv=None):
                            f"-> {path.name} {vals}")
             seen[k] = (path.name, vals)
 
+    (out / "ccd_aliases.json").write_text(json.dumps(CCD_ALIASES, indent=1) + "\n")
+            
     # ---- load lists (paths relative to the output directory) ----------------
     def rel(paths):
         return [p.relative_to(out).as_posix() for p, _ in paths]
@@ -786,7 +795,8 @@ def main(argv=None):
         matched = []
         for code in codes:
             c = code.upper()
-            hit, how = (c, "exact") if c in resinfo else (CCD_ALIASES.get(c), "alias")
+            alias = next((a for a in CCD_ALIASES.get(c, []) if a in resinfo), None)
+            hit, how = (c, "exact") if c in resinfo else (alias, "alias")
             if hit and hit in resinfo:
                 kind, name, charge, comment, fname = resinfo[hit]
                 tsv.append(f"{code}\t{name}\t{how}\t{kind}\t{charge}\t{fname}\t{comment}")

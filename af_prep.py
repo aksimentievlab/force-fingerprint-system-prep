@@ -21,8 +21,7 @@ Optional: VMD (to run the generated build script); Dowser++ for internal waters.
 
 Example:
   python af_prep.py models/AF-*.pdb --outdir prep --ph 7.0 \
-      --toppar toppar/top_all36_prot.rtf toppar/toppar_water_ions.str \
-               toppar/toppar_all36_prot_heme.str \
+      --toppar ./toppar \
       --solvate --run-vmd \
       --dowser-dir /path/to/dowserplusplus --dowser-path /path/to/R/bin -j 8
 """
@@ -81,19 +80,25 @@ COFACTOR_NAME_TO_CCD = {
 # of these RESI entries exists in the --toppar files AND its heavy-atom bond
 # graph matches the transplanted ligand; atom names are mapped automatically.
 CCD_TO_CHARMM = {
-    "ZN": ["ZN2"], "CA": ["CAL"], "NA": ["SOD"], "K": ["POT"], "CL": ["CLA"],
-    "CD": ["CD2"], "HEM": ["HEME"], "NAI": ["NADH"], "NAP": ["NADP"],
-    "NDP": ["NADPH", "NDPH"], "FAD": ["FAD", "FADH"],
+    # water and ions (toppar_water_ions)
+    "HOH": ["TIP3"], "NA": ["SOD"], "K": ["POT"], "CL": ["CLA"], "CA": ["CAL"],
+    "LI": ["LIT"], "RB": ["RUB"], "CS": ["CES"], "BA": ["BAR"],
+    "ZN": ["ZN2"], "CD": ["CD2"],
+    # metal ions (toppar_ions_won) -- all present in your toppar
+    "FE2": ["FE2P"], "FE": ["FE3P"], "CU1": ["CU1P"], "CU": ["CU2P"], "MN": ["MN2P"],
+    "CO": ["CO2P"], "NI": ["NI2P"], "SR": ["SR2P"], "HG": ["HG2P"], "PB": ["PB2P"],
+    "AL": ["AL3P"], "LA": ["LA3P"], "GD3": ["GD3P"], "EU3": ["EU3P"], "YT3": ["Y3P"],
+    # cofactors whose CHARMM name differs from the PDB code
+    "HEM": ["HEME"],
+    "RET": ["RTAL"], "RTL": ["RTOL"],      # retinal, retinol
+    "FDA": ["FADR"], "FNR": ["FMNR"],      # fully reduced FAD / FMN
+    "CMO": ["CO"], "OXY": ["O2"],          # heme ligands: carbon monoxide, O2
 }
 
 # Ligands that need bonded models / special parameters in any case.
 NEEDS_BONDED = {"SF4", "FES", "F3S", "HEC"}
 COVALENT_HINTS = ("pyridoxal", "heme", "flavin", "fad", "fmn", "lipoyl",
                   "biotin", "phosphopantetheine", "retinal")
-
-DEFAULT_TOPPAR = ["top_all36_prot.rtf", "toppar_water_ions.str",
-                  "toppar_all36_prot_heme.str"]
-
 
 # --------------------------------------------------------------------------
 # Minimal structure handling
@@ -922,6 +927,11 @@ _RTF_CACHE = {}
 
 def load_rtf(paths):
     """{RESI name: (atom names, elements, heavy-atom bonds)} from topology/stream files."""
+
+    missing = [str(p) for p in paths if not Path(p).exists()]
+    if missing:
+        raise FileNotFoundError(f"topology files not found: {missing[:3]}{'...' if len(missing) > 3 else ''}")
+    
     key = tuple(str(p) for p in paths)
     if key in _RTF_CACHE:
         return _RTF_CACHE[key]
@@ -946,7 +956,11 @@ def load_rtf(paths):
             if kw in ("RESI", "PRES"):
                 cur = None
                 if kw == "RESI" and len(t) > 1:
-                    cur = res.setdefault(t[1].upper(), {"atoms": [], "el": {}, "bonds": set()})
+                    name = t[1].upper()
+                    if name in res:      # psfgen keeps the FIRST definition; read and discard
+                        cur = {"atoms": [], "el": {}, "bonds": set()}
+                    else:
+                        cur = res[name] = {"atoms": [], "el": {}, "bonds": set()}
             elif kw == "END":
                 cur = None
             elif cur is not None and kw == "ATOM" and len(t) >= 3:
@@ -961,13 +975,26 @@ def load_rtf(paths):
     _RTF_CACHE[key] = res
     return res
 
+def charmm_aliases(toppar):
+    table = {k: list(v) for k, v in CCD_TO_CHARMM.items()}
+    f = Path(toppar).resolve() / "ccd_aliases.json"
+    if f.exists():
+        for k, v in json.loads(f.read_text()).items():
+            v = [v] if isinstance(v, str) else v
+            table[k] = list(dict.fromkeys(table.get(k, []) + v))
+    return table
 
 def charmm_ligand(atoms, ccd, toppar):
     """Find a CHARMM RESI matching this ligand's heavy-atom graph.
     Returns (resname, {pdb atom name: charmm atom name}, message)."""
     import networkx as nx
     from networkx.algorithms import isomorphism
-    rtf = load_rtf(toppar)
+
+    top = Path(toppar).resolve()
+    topnames = [l.strip() for l in (top / "topologies_psfgen.txt").read_text().splitlines()
+             if l.strip()]
+    rtf = load_rtf([top / n for n in topnames])
+
     la = heavy(atoms) or atoms
     g = nx.Graph()
     for i, a in enumerate(la):
@@ -980,7 +1007,7 @@ def charmm_ligand(atoms, ccd, toppar):
             if np.linalg.norm(xyz[i] - xyz[j]) < ri + rj + 0.45:
                 g.add_edge(i, j)
     tried = []
-    for name in dict.fromkeys(CCD_TO_CHARMM.get(ccd, []) + [ccd]):
+    for name in dict.fromkeys([ccd] + charmm_aliases(toppar).get(ccd, [])):
         r = rtf.get(name)
         if r is None:
             continue
@@ -998,7 +1025,7 @@ def charmm_ligand(atoms, ccd, toppar):
         if gm.is_isomorphic():
             return name, {la[i].name: gm.mapping[i] for i in gm.mapping}, ""
     if not tried:
-        return None, {}, "no matching RESI in the --toppar files"
+        return None, {}, "no matching RESI in the --toppar directory"
     return None, {}, "heavy-atom graph does not match " + ", ".join(tried)
 
 
@@ -1031,11 +1058,14 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
     seg = lambda ch: f"PRO{ch}"
     tcl = [f"# psfgen build for {name} - generated by af_prep.py",
            "package require psfgen", "resetpsf"]
-    tcl += [f"topology {{{Path(t).resolve() if Path(t).exists() else t}}}"
-            for t in cfg.toppar]
+    topdir = Path(cfg.toppar).resolve()
+    toptclfile = topdir / 'load_psfgen.tcl'
+    if not Path(toptclfile).exists():
+        raise FileNotFoundError(f"{toptclfile} not found; first run toppar_prepare.py") 
+    tcl += [f"source {toptclfile}", 
+            f'load_charmm_topologies "{topdir}"']
     tcl += ["pdbalias residue HIS HSE", "pdbalias atom ILE CD1 CD",
             "pdbalias residue HOH TIP3", "pdbalias atom TIP3 O OH2", ""]
-
     by_chain = OrderedDict()
     for a in prot_heavy:
         by_chain.setdefault(a.chain, []).append(a)
@@ -1408,7 +1438,7 @@ def main(argv=None):
                    help="patch name for deprotonated Cys in your toppar")
     p.add_argument("--ss-cutoff", type=float, default=2.5)
     p.add_argument("--ss-min", type=float, default=1.8)
-    p.add_argument("--toppar", nargs="+", default=DEFAULT_TOPPAR)
+    p.add_argument("--toppar", default='./toppar')
     p.add_argument("--solvate", action="store_true")
     p.add_argument("--padding", type=float, default=12.0)
     p.add_argument("--salt", type=float, default=0.15)
