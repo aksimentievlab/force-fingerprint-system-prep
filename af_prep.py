@@ -330,14 +330,52 @@ def accession_from_header(path):
     return accs
 
 
-def fetch_uniprot(acc, cache_dir):
+RETRY_STATUS = {429, 500, 502, 503, 504}
+HTTP_RETRIES = 6          # set from --retries
+HTTP_BACKOFF = 2.0        # seconds; doubles each attempt, plus random jitter
+
+
+def http_get(url, timeout):
+    """GET with retries for dropped connections, timeouts and HTTP 429/5xx
+    (exponential backoff with jitter; honours Retry-After).  Other HTTP errors,
+    e.g. 404, are returned to the caller without retrying."""
+    import random
+    import time
     import requests
+    for attempt in range(HTTP_RETRIES):
+        last = attempt == HTTP_RETRIES - 1
+        wait = HTTP_BACKOFF * 2 ** attempt + random.uniform(0, HTTP_BACKOFF)
+        try:
+            r = requests.get(url, timeout=timeout, headers={"User-Agent": "af_prep.py"})
+        except (requests.ConnectionError, requests.Timeout):
+            if last:
+                raise
+            time.sleep(wait)
+            continue
+        if r.status_code in RETRY_STATUS and not last:
+            try:
+                wait = max(wait, float(r.headers.get("Retry-After", 0)))
+            except ValueError:
+                pass
+            time.sleep(wait)
+            continue
+        return r
+
+
+def _atomic_write(path, text):
+    """Write via a temporary file, so a parallel reader never sees half a file."""
+    tmp = path.with_name(f"{path.name}.tmp{os.getpid()}")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def fetch_uniprot(acc, cache_dir):
     cache = Path(cache_dir) / f"{acc}.json"
     if cache.exists():
         return json.loads(cache.read_text())
-    r = requests.get(UNIPROT_URL.format(acc=acc), timeout=30)
+    r = http_get(UNIPROT_URL.format(acc=acc), timeout=30)
     r.raise_for_status()
-    cache.write_text(r.text)
+    _atomic_write(cache, r.text)
     return r.json()
 
 
@@ -420,20 +458,34 @@ def get_alphafill(acc, af_id, mode, url_tmpl, cache_dir, rep):
                 return hits[0]
         rep.info(f"no AlphaFill file for {acc} in {d}")
         return None
-    dest = Path(cache_dir) / f"{acc}.alphafill.cif"
-    if dest.exists():
-        return dest
     try:
-        import requests
-        r = requests.get(url_tmpl.format(acc=acc, af_id=af_id), timeout=120)
-        r.raise_for_status()
-        if not r.text.lstrip().startswith("data_"):
-            raise ValueError("response is not mmCIF")
-        dest.write_text(r.text)
-        return dest
+        dest = download_alphafill(acc, af_id, url_tmpl, cache_dir)
     except Exception as exc:  # noqa: BLE001
         rep.info(f"AlphaFill download failed ({exc}); no cofactors transplanted")
         return None
+    if dest is None:
+        rep.info(f"AlphaFill has no entry for {acc}")
+    return dest
+
+
+def download_alphafill(acc, af_id, url_tmpl, cache_dir):
+    """Cached AlphaFill mmCIF path, or None if AlphaFill has no entry (remembered
+    with an empty '<acc>.alphafill.none' file so it is not asked again)."""
+    dest = Path(cache_dir) / f"{acc}.alphafill.cif"
+    none = Path(cache_dir) / f"{acc}.alphafill.none"
+    if dest.exists():
+        return dest
+    if none.exists():
+        return None
+    r = http_get(url_tmpl.format(acc=acc, af_id=af_id), timeout=120)
+    if r.status_code == 404:
+        none.touch()
+        return None
+    r.raise_for_status()
+    if not r.text.lstrip().startswith("data_"):
+        raise ValueError("response is not mmCIF")
+    _atomic_write(dest, r.text)
+    return dest
 
 
 def kabsch(P, Q):
@@ -1270,6 +1322,62 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
 # Driver
 # --------------------------------------------------------------------------
 
+def model_accession(model, cfg):
+    """(accession, AlphaFold id, review notes) from header, file name or --accession."""
+    notes = []
+    acc, af_id = accession_from_name(model)
+    head = accession_from_header(model)
+    if len(head) > 1:
+        notes.append(f"several accessions in header {head}; using {head[0]} "
+                     "(multimer or chimera?)")
+    if head:
+        if acc and acc != head[0]:
+            notes.append(f"file name says {acc} but header says {head[0]}; using header")
+        if acc != head[0]:
+            acc, af_id = head[0], f"AF-{head[0]}-F1"
+    if cfg.accession:
+        acc = cfg.accession
+        af_id = af_id or f"AF-{acc}-F1"
+    return acc, af_id, notes
+
+
+def prefetch(cfg):
+    """Download UniProt entries (and AlphaFill files with --alphafill auto) for
+    all models before processing, with at most cfg.max_downloads connections at
+    a time, so parallel workers read from the cache instead of all hitting the
+    servers at once.  Failures are only counted here; the model's own lookup
+    retries and reports them."""
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = {}
+    for m in cfg.models:
+        try:
+            acc, af_id, _ = model_accession(Path(m), cfg)
+        except Exception:  # noqa: BLE001 - reported again in process()
+            continue
+        if not acc:
+            continue
+        if not cfg.no_uniprot and not (cfg.cache / f"{acc}.json").exists():
+            jobs[("uniprot", acc)] = lambda a=acc: fetch_uniprot(a, cfg.cache)
+        if cfg.alphafill == "auto" and not (cfg.cache / f"{acc}.alphafill.cif").exists() \
+                and not (cfg.cache / f"{acc}.alphafill.none").exists():
+            jobs[("alphafill", acc)] = lambda a=acc, i=af_id: download_alphafill(
+                a, i, cfg.alphafill_url, cfg.cache)
+    if not jobs:
+        return
+    log.warning("downloading %d UniProt/AlphaFill entries (%d at a time)",
+                len(jobs), cfg.max_downloads)
+    failed = []
+    with ThreadPoolExecutor(max_workers=cfg.max_downloads) as ex:
+        futures = {k: ex.submit(f) for k, f in jobs.items()}
+        for k, fut in futures.items():
+            try:
+                fut.result()
+            except Exception as exc:  # noqa: BLE001
+                failed.append(f"{k[0]} {k[1]} ({exc})")
+    if failed:
+        log.warning("%d downloads failed after retries, e.g. %s", len(failed), failed[0])
+
+
 def process(model, cfg):
     model = Path(model)
     name = re.sub(r"[^A-Za-z0-9_.-]", "_", model.stem)
@@ -1279,19 +1387,9 @@ def process(model, cfg):
     cfg._transfer_drops = False
     for nm, ccd in cfg.name_map.items():          # user-supplied UniProt name -> CCD
         NAME_TO_CCD_NORM[norm_name(nm)] = [ccd]
-    acc, af_id = accession_from_name(model)
-    head = accession_from_header(model)
-    if len(head) > 1:
-        rep.review(f"several accessions in header {head}; using {head[0]} "
-                   "(multimer or chimera?)")
-    if head:
-        if acc and acc != head[0]:
-            rep.review(f"file name says {acc} but header says {head[0]}; using header")
-        if acc != head[0]:
-            acc, af_id = head[0], f"AF-{head[0]}-F1"
-    if cfg.accession:
-        acc = cfg.accession
-        af_id = af_id or f"AF-{acc}-F1"
+    acc, af_id, notes = model_accession(model, cfg)
+    for n in notes:
+        rep.review(n)
     rep.data["accession"] = acc
 
     # --- input model and pLDDT
@@ -1494,6 +1592,10 @@ def main(argv=None):
     p.add_argument("--alphafill", default="auto",
                    help="'auto' (download), a directory of AlphaFill .cif files, or 'none'")
     p.add_argument("--alphafill-url", default=ALPHAFILL_URL)
+    p.add_argument("--max-downloads", type=int, default=4,
+                   help="parallel connections when downloading UniProt/AlphaFill entries")
+    p.add_argument("--retries", type=int, default=6,
+                   help="attempts per download (backoff 2, 4, 8, ... s with jitter)")
     p.add_argument("--alphafill-coords", choices=("model", "alphafill"), default="model",
                    help="'model': keep the input structure and move AlphaFill ligands onto "
                         "it by local superposition; 'alphafill': use AlphaFill's protein")
@@ -1597,6 +1699,10 @@ def main(argv=None):
                  "(a version that writes ccd_aliases.json and uniprot_states.json)")
     if shutil.which(cfg.pdb2pqr) is None:
         sys.exit(f"pdb2pqr executable '{cfg.pdb2pqr}' not found")
+
+    global HTTP_RETRIES
+    HTTP_RETRIES = max(1, cfg.retries)
+    prefetch(cfg)
 
     if cfg.jobs > 1:
         # models are independent; each Dowser++ run uses its own copy of the

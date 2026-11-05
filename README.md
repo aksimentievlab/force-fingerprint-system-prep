@@ -345,6 +345,8 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 | `--outdir` | `af_prep_out` | output folder |
 | `--toppar` | `./toppar` | output folder of `toppar_prepare.py` |
 | `--cache` | `<outdir>/cache` | UniProt/AlphaFill cache |
+| `--max-downloads` | 4 | parallel connections for UniProt/AlphaFill downloads, which are done before processing starts |
+| `--retries` | 6 | attempts per download; dropped connections, timeouts and HTTP 429/5xx are retried with backoff (2, 4, 8, … s) |
 | `--accession` | | UniProt accession, for single-model runs without header information |
 | `--no-uniprot` | | skip UniProt; with the binding-site rule, no cofactors are kept |
 | `--name-map NAME=CODE` | | map a UniProt ligand name to a PDB code (repeatable) |
