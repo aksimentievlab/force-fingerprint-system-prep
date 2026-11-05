@@ -274,7 +274,9 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 - PDB2PQR with PROPKA, at `--ph`.
 - States are read from the hydrogens PDB2PQR adds: HSD/HSE/HSP, ASPP, GLUP, LSN.
 - PDB2PQR's coordinates are kept, including its Asn/Gln/His flips.
-- Residues with pKa near the pH, and titratable residues next to a cofactor (PROPKA doesn't see cofactors), are reported.
+- The kept cofactors and ligands are included:
+  PROPKA accounts for organic ligands with its ligand model and treats metal ions as point charges.
+- Residues with pKa near the pH are reported.
 
 **6. Metal sites and disulfides.**
 - Residues coordinating a metal are overridden: His tautomer from the coordinating nitrogen, Asp/Glu deprotonated, Cys deprotonated (`--cys-deprot-patch`, default `CYSD`).
@@ -326,7 +328,6 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 | cofactor NOT built (no matching RESI) | add its topology (e.g. CGenFF via `toppar_prepare.py --extra-stream`) or an alias in `CCD_ALIASES` |
 | annotated cofactor not placed / cofactor binding site left empty | AlphaFill had no copy that fits the model's pocket (the reason is given); consider a homolog structure or co-folding |
 | UniProt suggests a state that isn't available | the cofactor was built from its PDB code; check its charge/redox state |
-| residue within 4.5 Å of a cofactor | its protonation was computed without the cofactor; check it |
 | covalent cofactor/modification | needs a custom patch (e.g. PLP–Lys) |
 | Dowser++ failed | see `dowser/*.log`; the model is built without internal waters |
 | psfgen reported errors | see `build/vmd.log` |

@@ -853,13 +853,20 @@ def parse_pka_summary(text):
     return pkas
 
 
-def run_pdb2pqr(protein, waters, workdir, cfg, rep):
+def run_pdb2pqr(protein, waters, ligands, workdir, cfg, rep):
+    """PDB2PQR + PROPKA on protein, internal waters and kept ligands.  PDB2PQR
+    passes unknown HETATM residues on to PROPKA, which includes organic ligands
+    and treats metal ions as point charges; the ligands themselves are left out
+    of PDB2PQR's output, which is fine since only the protein is taken from it."""
     wd = (Path(workdir) / "pdb2pqr").resolve()
     wd.mkdir(exist_ok=True)
     inp = wd / "p2p_in.pdb"
     wat = [replace(w, record="HETATM", resname="HOH", name="O", chain="W", resnum=i)
            for i, w in enumerate(waters, 1)]
-    write_pdb(heavy(protein) + wat, inp)
+    # own chain + numbering, so ligands can never be taken for protein residues
+    lig = [replace(a, record="HETATM", chain="L", resnum=k, icode="")
+           for k, l in enumerate(ligands, 1) for a in heavy(l["atoms"])]
+    write_pdb(heavy(protein) + lig + wat, inp)
     out_pdb, out_pqr = wd / "p2p_out.pdb", wd / "p2p_out.pqr"
     cmd = [cfg.pdb2pqr, "--ff=CHARMM", "--ffout=CHARMM",
            "--titration-state-method=propka", f"--with-ph={cfg.ph}",
@@ -1347,9 +1354,9 @@ def process(model, cfg):
     waters = run_dowser(protein, lig_atoms, outdir, cfg, rep) if cfg.dowser_dir else []
 
     # --- 5. PDB2PQR
-    p2p_atoms, pkas, p2p_disu = run_pdb2pqr(protein, waters, outdir, cfg, rep)
+    p2p_atoms, pkas, p2p_disu = run_pdb2pqr(protein, waters, ligands, outdir, cfg, rep)
     p2p_prot = [a for a in p2p_atoms if (a.chain, a.resnum) in orig_resname
-                and a.chain != "W" and not is_water(a)]
+                and a.chain not in ("W", "L") and not is_water(a)]
     missing = set(orig_resname) - {(a.chain, a.resnum) for a in p2p_prot}
     if missing:
         raise RuntimeError(f"PDB2PQR dropped residues: {sorted(missing)[:10]}")
@@ -1416,16 +1423,9 @@ def process(model, cfg):
         if abs(pka - cfg.ph) < cfg.pka_window and (ch, rn) not in metal_bound:
             rep.info(f"{rname} {ch}{rn} pKa {pka:.2f} within {cfg.pka_window} of pH")
 
-    # titratable residues near organic cofactors: PROPKA did not see them
-    org = [a for l in ligands if not l["metal"] for a in heavy(l["atoms"])]
-    if org:
-        t = cKDTree(coords(org))
-        near = {(a.chain, a.resnum) for a in prot_heavy
-                if orig_resname[(a.chain, a.resnum)] in ("ASP", "GLU", "HIS", "LYS", "CYS")
-                and t.query(a.xyz)[0] < 4.5}
-        for key in sorted(near - metal_bound):
-            rep.review(f"{orig_resname[key]} {key[0]}{key[1]} is within 4.5 A of a "
-                       "cofactor; its protonation was computed without it")
+    if ligands:
+        rep.info(f"PROPKA included {len(ligands)} ligand(s): organic ligands with "
+                 "PROPKA's ligand model, metal ions as point charges")
 
     patches = [(st, k[0], k[1]) for k, st in sorted(states.items())
                if not st.startswith("HS")]
