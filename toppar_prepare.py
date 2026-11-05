@@ -149,6 +149,83 @@ UNIPROT_STATES = {
 CTRL_NOOPS = {"BOMLEV", "BOMB", "WRNLEV", "WRNL", "PRNLEV", "PRNL", "ECHO",
               "IOFORMAT", "IOFO", "FASTER", "LABEL", "TIMER"}
 
+# Bond pairs that are typos in the distributed CHARMM files:
+# (residue, pair as written twice) -> pair it should have been
+KNOWN_BOND_FIXES = {
+    ("NDP", frozenset(("PN", "O1N"))): ("PN", "O2N"),   # NADPH: O2N otherwise unbonded
+}
+_BOND_KW = ("BOND", "DOUB", "TRIP", "AROM")
+_BLOCK_KW = ("RESI", "PRES", "END", "MASS", "DEFA", "AUTO", "DECL")
+
+
+def _strip_comment(line):
+    return line.split("!", 1)[0]
+
+
+def fix_bonds(sections, log, label):
+    """In RTF sections: replace known typo bonds, drop bond pairs listed twice in
+    a residue (psfgen rejects them with 'duplicate bond'; CHARMM ignores them), and
+    report residues that still have an atom without any bond."""
+    for sec in sections:
+        if sec.kind != "rtf":
+            continue
+        res, seen, atoms, bonded = None, set(), [], set()
+        out = []
+
+        def report():
+            if res and len(atoms) > 1:
+                orphans = [a for a in atoms if a not in bonded and not a.startswith("LP")]
+                if orphans:
+                    log.append(f"{label}: RESI {res} has atom(s) without any bond {orphans} "
+                               "(fine for ion-water complexes, otherwise check)")
+
+        for raw in sec.lines:
+            out.append(raw)
+            toks = _strip_comment(raw).split()
+            if not toks:
+                continue
+            kw = toks[0].upper()[:4]
+            if kw in _BLOCK_KW:
+                report()
+                res = toks[1].upper() if kw == "RESI" and len(toks) > 1 else None
+                seen, atoms, bonded = set(), [], set()
+                continue
+            if res is None:
+                continue
+            if kw == "ATOM" and len(toks) > 1:
+                atoms.append(toks[1].upper())
+                continue
+            if kw not in _BOND_KW:
+                continue
+            names = toks[1:]
+            keep, changed = [], False
+            for a, b in zip(names[::2], names[1::2]):
+                pair = frozenset((a.upper(), b.upper()))
+                if a[0] in "+-" or b[0] in "+-":
+                    keep += [a, b]
+                    continue
+                if pair in seen:
+                    fix = KNOWN_BOND_FIXES.get((res, pair))
+                    if fix and frozenset(fix) not in seen:
+                        log.append(f"{label}: RESI {res}: duplicated bond {a}-{b} corrected "
+                                   f"to {fix[0]}-{fix[1]} (known typo)")
+                        a, b, pair = fix[0], fix[1], frozenset(fix)
+                    else:
+                        log.append(f"{label}: RESI {res}: duplicate bond {a}-{b} removed")
+                        changed = True
+                        continue
+                    changed = True
+                seen.add(pair)
+                bonded |= pair
+                keep += [a, b]
+            if changed:
+                new = (f"{toks[0]} " + "  ".join(f"{x} {y}" for x, y in zip(keep[::2], keep[1::2]))
+                       if keep else "")
+                out[-1] = f"! [duplicate bond] {raw.strip()}"
+                if new:
+                    out.append(new)
+        report()
+        sec.lines[:] = out
 
 class StreamError(RuntimeError):
     pass
@@ -680,6 +757,7 @@ def main(argv=None):
             s.source = src.name
         sections = sections_override if sections_override is not None else result.sections
         drop_earlier_duplicates(sections, log, src.name)
+        fix_bonds(sections, log, src.name)
         for note in result.notes:
             log.append(f"note: {note}")
         stem = label or src.stem
@@ -721,6 +799,7 @@ def main(argv=None):
             s.source = cpath.name
         sections, label = apply_cufix(stock, cufix, log), "toppar_water_ions_cufix"
     drop_earlier_duplicates(sections, log, label)
+    fix_bonds(sections, log, label)
     water_rtf, water_prm = out / f"{label}.rtf", out / f"{label}.prm"
     water_rtf.write_text(render(sections, "rtf", f"{WATER_IONS} + CUFIX" if "cufix" in label
                                 else WATER_IONS))
