@@ -115,13 +115,14 @@ WATER_IONS = "toppar_water_ions.str"
 MARKER = "toppar_prepare.log"                               # identifies our output dir
 BUNDLED_CUFIX = "non_charmm/toppar_ions_nbfix_uiuc.str"   # Yoo & Aksimentiev, 2019
 
-# PDB chemical-component codes whose CHARMM residue has a different name.
+# PDB chemical-component code -> CHARMM residue names, tried in order AFTER the
+# PDB code itself.  af_prep.py reads these from ccd_aliases.json.
 CCD_ALIASES = {
     # water and ions (toppar_water_ions)
     "HOH": ["TIP3"], "NA": ["SOD"], "K": ["POT"], "CL": ["CLA"], "CA": ["CAL"],
     "LI": ["LIT"], "RB": ["RUB"], "CS": ["CES"], "BA": ["BAR"],
     "ZN": ["ZN2"], "CD": ["CD2"],
-    # metal ions (toppar_ions_won) -- all present in your toppar
+    # metal ions (toppar_ions_won)
     "FE2": ["FE2P"], "FE": ["FE3P"], "CU1": ["CU1P"], "CU": ["CU2P"], "MN": ["MN2P"],
     "CO": ["CO2P"], "NI": ["NI2P"], "SR": ["SR2P"], "HG": ["HG2P"], "PB": ["PB2P"],
     "AL": ["AL3P"], "LA": ["LA3P"], "GD3": ["GD3P"], "EU3": ["EU3P"], "YT3": ["Y3P"],
@@ -131,6 +132,20 @@ CCD_ALIASES = {
     "FDA": ["FADR"], "FNR": ["FMNR"],      # fully reduced FAD / FMN
     "CMO": ["CO"], "OXY": ["O2"],          # heme ligands: carbon monoxide, O2
 }
+
+# UniProt ligand name -> CHARMM residues for that charge/redox state, tried
+# BEFORE the PDB code.  af_prep.py reads these from uniprot_states.json.
+UNIPROT_STATES = {
+    "Na(+)": ["SOD"], "K(+)": ["POT"], "Mg(2+)": ["MG"], "Ca(2+)": ["CAL"],
+    "Zn(2+)": ["ZN2"], "Cd(2+)": ["CD2"], "Sr(2+)": ["SR2P"],
+    "Fe(2+)": ["FE2P"], "Fe(3+)": ["FE3P"],
+    "Cu(+)": ["CU1P"], "Cu(2+)": ["CU2P"],
+    "Mn(2+)": ["MN2P"], "Co(2+)": ["CO2P"], "Ni(2+)": ["NI2P"],
+    "NAD(+)": ["NAD"], "NADH": ["NAI"], "NADP(+)": ["NAP"], "NADPH": ["NDP"],
+    "FAD": ["FAD"], "FADH2": ["FADR"], "FMN": ["FMN"], "FMNH2": ["FMNR"],
+    "heme b": ["HEME"],
+}
+
 CTRL_NOOPS = {"BOMLEV", "BOMB", "WRNLEV", "WRNL", "PRNLEV", "PRNL", "ECHO",
               "IOFORMAT", "IOFO", "FASTER", "LABEL", "TIMER"}
 
@@ -737,10 +752,11 @@ def main(argv=None):
                 log.append(f"override {sec:9s} {' '.join(key):16s} {seen[k][0]} {seen[k][1]} "
                            f"-> {path.name} {vals}")
             seen[k] = (path.name, vals)
-
-    (out / "ccd_aliases.json").write_text(json.dumps(CCD_ALIASES, indent=1) + "\n")
             
     # ---- load lists (paths relative to the output directory) ----------------
+    (out / "ccd_aliases.json").write_text(json.dumps(CCD_ALIASES, indent=1) + "\n")
+    (out / "uniprot_states.json").write_text(json.dumps(UNIPROT_STATES, indent=1) + "\n")
+
     def rel(paths):
         return [p.relative_to(out).as_posix() for p, _ in paths]
 

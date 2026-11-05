@@ -67,38 +67,26 @@ COFACTOR_NAME_TO_CCD = {
     "Ni(2+)": ["NI"], "Co(2+)": ["CO"], "Cd(2+)": ["CD"],
     "K(+)": ["K"], "Na(+)": ["NA"],
     "heme": ["HEM", "HEC"], "heme b": ["HEM"], "heme c": ["HEC"],
-    "FAD": ["FAD"], "FMN": ["FMN"], "NAD(+)": ["NAD"], "NADP(+)": ["NAP"],
-    "NADH": ["NAI"], "NADPH": ["NDP"],
+    "FAD": ["FAD", "FDA"], "FMN": ["FMN", "FNR"], "NAD(+)": ["NAD", "NAI"],
+    "NADP(+)": ["NAP", "NDP"],
+    "NADH": ["NAI", "NAD"], "NADPH": ["NDP", "NAP"],
+    "FADH2": ["FDA", "FAD"], "FMNH2": ["FNR", "FMN"],   # reduced: accept either code
     "pyridoxal 5'-phosphate": ["PLP"], "thiamine diphosphate": ["TPP"],
     "[4Fe-4S] cluster": ["SF4"], "[2Fe-2S] cluster": ["FES"],
     "[3Fe-4S] cluster": ["F3S"], "Mo-molybdopterin": ["MTE"],
     "biotin": ["BTN"], "coenzyme A": ["COA"],
 }
 
-# CCD code -> CHARMM residue names to try, in order, when they differ from the
-# CCD code (the CCD code itself is always tried too). A ligand is built when one
-# of these RESI entries exists in the --toppar files AND its heavy-atom bond
-# graph matches the transplanted ligand; atom names are mapped automatically.
-CCD_TO_CHARMM = {
-    # water and ions (toppar_water_ions)
-    "HOH": ["TIP3"], "NA": ["SOD"], "K": ["POT"], "CL": ["CLA"], "CA": ["CAL"],
-    "LI": ["LIT"], "RB": ["RUB"], "CS": ["CES"], "BA": ["BAR"],
-    "ZN": ["ZN2"], "CD": ["CD2"],
-    # metal ions (toppar_ions_won) -- all present in your toppar
-    "FE2": ["FE2P"], "FE": ["FE3P"], "CU1": ["CU1P"], "CU": ["CU2P"], "MN": ["MN2P"],
-    "CO": ["CO2P"], "NI": ["NI2P"], "SR": ["SR2P"], "HG": ["HG2P"], "PB": ["PB2P"],
-    "AL": ["AL3P"], "LA": ["LA3P"], "GD3": ["GD3P"], "EU3": ["EU3P"], "YT3": ["Y3P"],
-    # cofactors whose CHARMM name differs from the PDB code
-    "HEM": ["HEME"],
-    "RET": ["RTAL"], "RTL": ["RTOL"],      # retinal, retinol
-    "FDA": ["FADR"], "FNR": ["FMNR"],      # fully reduced FAD / FMN
-    "CMO": ["CO"], "OXY": ["O2"],          # heme ligands: carbon monoxide, O2
-}
+# PDB-code -> CHARMM aliases and UniProt state -> CHARMM residue come from the
+# toppar folder (ccd_aliases.json, uniprot_states.json, written by
+# toppar_prepare.py), so they always match the topologies psfgen will load.
 
 # Ligands that need bonded models / special parameters in any case.
 NEEDS_BONDED = {"SF4", "FES", "F3S", "HEC"}
 COVALENT_HINTS = ("pyridoxal", "heme", "flavin", "fad", "fmn", "lipoyl",
                   "biotin", "phosphopantetheine", "retinal")
+
+
 
 # --------------------------------------------------------------------------
 # Minimal structure handling
@@ -355,7 +343,7 @@ def allowed_ligands(uni, extra, rep):
                        "COFACTOR_NAME_TO_CCD")
     # site_res[ccd][label] = residue numbers. UniProt labels distinguish several
     # copies of the same ligand ("1", "2"); unlabelled features form one site.
-    site_res, unmapped = {}, {}
+    site_res, unmapped, site_names = {}, {}, {}
     for s in uni["sites"]:
         ccds = NAME_TO_CCD_NORM.get(norm_name(s["ligand"]))
         if not ccds:
@@ -365,7 +353,11 @@ def allowed_ligands(uni, extra, rep):
         for c in ccds:
             site_res.setdefault(c, {}).setdefault(s.get("label", ""), set()).update(
                 range(s["start"], s["end"] + 1))
-    return allowed, expected, site_res, unmapped
+            site_names.setdefault(c, {}).setdefault(s.get("label", ""), set()).add(s["ligand"])
+    for name in uni["cofactors"]:                 # fallback when a site gives no state
+        for c in NAME_TO_CCD_NORM.get(norm_name(name), []):
+            site_names.setdefault(c, {}).setdefault("*cofactor*", set()).add(name)
+    return allowed, expected, site_res, unmapped, site_names
 
 
 # --------------------------------------------------------------------------
@@ -593,6 +585,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd, cfg,
         # claim the open site this copy contacts most
         sk = max(open_sites, key=lambda k: c["touched"][(k[1], k[2])])
         filled.add(sk)
+        c["site_label"] = sk[2]
         kept.append(c)
         label = f" site {sk[2]}" if sk[2] else ""
         fit = fit_rmsd.get(c["key"])
@@ -927,15 +920,13 @@ _RTF_CACHE = {}
 
 def load_rtf(paths):
     """{RESI name: (atom names, elements, heavy-atom bonds)} from topology/stream files."""
-
-    missing = [str(p) for p in paths if not Path(p).exists()]
-    if missing:
-        raise FileNotFoundError(f"topology files not found: {missing[:3]}{'...' if len(missing) > 3 else ''}")
-    
     key = tuple(str(p) for p in paths)
     if key in _RTF_CACHE:
         return _RTF_CACHE[key]
-    texts = [Path(p).read_text(errors="replace") for p in paths if Path(p).exists()]
+    missing = [str(p) for p in paths if not Path(p).exists()]
+    if missing:
+        raise FileNotFoundError(f"topology files not found: {missing[:3]}")
+    texts = [Path(p).read_text(errors="replace") for p in paths]
     type_el = {}
     for txt in texts:
         for line in txt.splitlines():
@@ -975,26 +966,42 @@ def load_rtf(paths):
     _RTF_CACHE[key] = res
     return res
 
-def charmm_aliases(toppar):
-    table = {k: list(v) for k, v in CCD_TO_CHARMM.items()}
-    f = Path(toppar).resolve() / "ccd_aliases.json"
-    if f.exists():
-        for k, v in json.loads(f.read_text()).items():
-            v = [v] if isinstance(v, str) else v
-            table[k] = list(dict.fromkeys(table.get(k, []) + v))
-    return table
 
-def charmm_ligand(atoms, ccd, toppar):
+TOPPAR_FILES = ("load_psfgen.tcl", "topologies_psfgen.txt", "ccd_aliases.json",
+                "uniprot_states.json")
+
+
+def _toppar_json(toppar, fname):
+    key = ("json", str(Path(toppar).resolve()), fname)
+    if key not in _RTF_CACHE:
+        d = json.loads((Path(toppar).resolve() / fname).read_text())
+        _RTF_CACHE[key] = {k: ([v] if isinstance(v, str) else list(v)) for k, v in d.items()}
+    return _RTF_CACHE[key]
+
+
+def charmm_aliases(toppar):
+    """PDB code -> CHARMM residue names (toppar_prepare.py's CCD_ALIASES)."""
+    return {k.upper(): v for k, v in _toppar_json(toppar, "ccd_aliases.json").items()}
+
+
+def uniprot_states(toppar):
+    """normalised UniProt ligand name -> CHARMM residue names (UNIPROT_STATES)."""
+    return {norm_name(k): v for k, v in _toppar_json(toppar, "uniprot_states.json").items()}
+
+
+def charmm_ligand(atoms, ccd, toppar, uniprot_names=()):
     """Find a CHARMM RESI matching this ligand's heavy-atom graph.
-    Returns (resname, {pdb atom name: charmm atom name}, message)."""
+    Residues for the ligand's UniProt state (e.g. Fe(2+) -> FE2P, NADH -> NAI) are
+    tried first, then the PDB code, then its aliases.
+    Returns (resname, {pdb atom name: charmm atom name}, message, note)."""
     import networkx as nx
     from networkx.algorithms import isomorphism
-
     top = Path(toppar).resolve()
-    topnames = [l.strip() for l in (top / "topologies_psfgen.txt").read_text().splitlines()
+    names = [l.strip() for l in (top / "topologies_psfgen.txt").read_text().splitlines()
              if l.strip()]
-    rtf = load_rtf([top / n for n in topnames])
-
+    rtf = load_rtf([top / n for n in names])
+    states = uniprot_states(toppar)
+    prefer = list(dict.fromkeys(r for n in uniprot_names for r in states.get(norm_name(n), [])))
     la = heavy(atoms) or atoms
     g = nx.Graph()
     for i, a in enumerate(la):
@@ -1006,8 +1013,9 @@ def charmm_ligand(atoms, ccd, toppar):
             rj = COVALENT_R.get(la[j].element.upper(), 0.8)
             if np.linalg.norm(xyz[i] - xyz[j]) < ri + rj + 0.45:
                 g.add_edge(i, j)
+    default = list(dict.fromkeys([ccd] + charmm_aliases(toppar).get(ccd, [])))
     tried = []
-    for name in dict.fromkeys([ccd] + charmm_aliases(toppar).get(ccd, [])):
+    for name in dict.fromkeys(prefer + default):
         r = rtf.get(name)
         if r is None:
             continue
@@ -1023,10 +1031,19 @@ def charmm_ligand(atoms, ccd, toppar):
             continue
         gm = isomorphism.GraphMatcher(g, h, node_match=lambda x, y: x["el"] == y["el"])
         if gm.is_isomorphic():
-            return name, {la[i].name: gm.mapping[i] for i in gm.mapping}, ""
+            note = ""
+            if len(prefer) > 1:
+                note = (f"UniProt names {list(uniprot_names)} suggest several states "
+                        f"{prefer}; used the first that matches")
+            elif prefer and name in prefer:
+                note = f"state from UniProt '{', '.join(uniprot_names)}'"
+            elif prefer:
+                note = (f"UniProt '{', '.join(uniprot_names)}' suggests {prefer[0]}, which "
+                        "is not in the toppar or does not match; used the PDB code's residue")
+            return name, {la[i].name: gm.mapping[i] for i in gm.mapping}, "", note
     if not tried:
-        return None, {}, "no matching RESI in the --toppar directory"
-    return None, {}, "heavy-atom graph does not match " + ", ".join(tried)
+        return None, {}, "no matching RESI in the toppar folder", ""
+    return None, {}, "heavy-atom graph does not match " + ", ".join(tried), ""
 
 
 def normalize_cterm(atoms, patch):
@@ -1058,14 +1075,11 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
     seg = lambda ch: f"PRO{ch}"
     tcl = [f"# psfgen build for {name} - generated by af_prep.py",
            "package require psfgen", "resetpsf"]
-    topdir = Path(cfg.toppar).resolve()
-    toptclfile = topdir / 'load_psfgen.tcl'
-    if not Path(toptclfile).exists():
-        raise FileNotFoundError(f"{toptclfile} not found; first run toppar_prepare.py") 
-    tcl += [f"source {toptclfile}", 
-            f'load_charmm_topologies "{topdir}"']
+    toptcl = Path(cfg.toppar).resolve() / "load_psfgen.tcl"
+    tcl += [f"source {{{toptcl}}}", f'load_charmm_topologies "{toptcl.parent}"']
     tcl += ["pdbalias residue HIS HSE", "pdbalias atom ILE CD1 CD",
             "pdbalias residue HOH TIP3", "pdbalias atom TIP3 O OH2", ""]
+
     by_chain = OrderedDict()
     for a in prot_heavy:
         by_chain.setdefault(a.chain, []).append(a)
@@ -1098,8 +1112,10 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
         sid = f"HT{k:02d}"
         ccd = lig["ccd"]
         f = bd / f"lig_{k:02d}_{ccd}.pdb"
-        rname, amap, why = (None, {}, "needs a bonded model / dedicated parameters") \
-            if ccd in NEEDS_BONDED else charmm_ligand(lig["atoms"], ccd, cfg.toppar)
+        rname, amap, why, note = \
+            (None, {}, "needs a bonded model / dedicated parameters", "") \
+            if ccd in NEEDS_BONDED else \
+            charmm_ligand(lig["atoms"], ccd, cfg.toppar, lig.get("uniprot", ()))
         if rname:
             la = [replace(a, record="HETATM", resname=rname, chain="X", resnum=1,
                           icode="", name=amap.get(a.name, a.name))
@@ -1109,12 +1125,16 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
             tcl += [f"segment {sid} {{\n    first none\n    last none\n{auto}"
                     f"    pdb {f.name}\n}}", f"coordpdb {f.name} {sid}"]
             lig_seg[id(lig)] = (sid, la, amap)
-            rep.info(f"{ccd} built as CHARMM residue {rname} (segment {sid})")
+            msg = f"{ccd} built as CHARMM residue {rname} (segment {sid})"
+            if note and ("suggest" in note):
+                rep.review(f"{msg}; {note}")
+            else:
+                rep.info(msg + (f"; {note}" if note else ""))
         else:
             write_pdb(heavy(lig["atoms"]), f, sid)
             rep.review(f"{ccd} NOT built ({why}) - written to build/{f.name}; add its "
-                       "topology to --toppar (CHARMM-GUI Ligand Reader / CGenFF) or a "
-                       "name to CCD_TO_CHARMM")
+                       "topology to the toppar (e.g. toppar_prepare.py --extra-stream with "
+                       "CGenFF output) or an alias to CCD_ALIASES in toppar_prepare.py")
             tcl += [f"# NEEDS_PARAMS: {ccd} in {f.name} (segment {sid}) not built"]
 
     for his, lig in phem:
@@ -1219,9 +1239,9 @@ def process(model, cfg):
                            f"{m['desc']} - needs a custom patch")
             elif m["type"] == "Glycosylation":
                 rep.info(f"glycosylation at {m['pos']}: {m['desc']} (not modelled)")
-    allowed, expected, site_res, unmapped = (
+    allowed, expected, site_res, unmapped, site_names = (
         allowed_ligands(uni, cfg.keep_ligands, rep) if uni
-        else (set(cfg.keep_ligands), set(), {}, {}))
+        else (set(cfg.keep_ligands), set(), {}, {}, {}))
 
     # --- 2. AlphaFill
     af_file = get_alphafill(acc, af_id, cfg.alphafill, cfg.alphafill_url, cfg.cache, rep)
@@ -1258,6 +1278,10 @@ def process(model, cfg):
 
     ligands = (select_ligands(protein, ligs, allowed, site_res, unmapped, fit_rmsd, cfg, rep)
                if ligs else [])
+    for lig in ligands:                           # UniProt names of the site each one fills
+        names = site_names.get(lig["ccd"], {})
+        lig["uniprot"] = sorted(names.get(lig["site_label"], set())
+                                or names.get("*cofactor*", set()))
     found = {l["ccd"] for l in ligands}
     for ccds in expected:
         if not found & set(ccds):
@@ -1275,7 +1299,7 @@ def process(model, cfg):
                 and not is_water(a)]
     missing = set(orig_resname) - {(a.chain, a.resnum) for a in p2p_prot}
     if missing:
-        raise RuntimeError(f"PDB2PQR dropped residues: {sorted(missing)[:10]}")
+        raise RuntimeError(f"PDB2PQR dropped residues: {sorted(missing)[:10]}{'...' if len(missing) > 3 else ''}")
     states, free_cys = decode_states([a for a in p2p_prot if a.is_h],
                                      orig_resname, rep)
     prot_heavy = heavy(p2p_prot)   # PDB2PQR coordinates include its NQH flips
@@ -1438,7 +1462,8 @@ def main(argv=None):
                    help="patch name for deprotonated Cys in your toppar")
     p.add_argument("--ss-cutoff", type=float, default=2.5)
     p.add_argument("--ss-min", type=float, default=1.8)
-    p.add_argument("--toppar", default='./toppar')
+    p.add_argument("--toppar", default="./toppar",
+                   help="output folder of toppar_prepare.py")
     p.add_argument("--solvate", action="store_true")
     p.add_argument("--padding", type=float, default=12.0)
     p.add_argument("--salt", type=float, default=0.15)
@@ -1483,6 +1508,9 @@ def main(argv=None):
         if not (d / cfg.dowser_script).exists():
             sys.exit(f"{cfg.dowser_script} not found in {d}")
         cfg.dowser_dir = d
+    missing = [f for f in TOPPAR_FILES if not (Path(cfg.toppar) / f).exists()]
+    if missing:
+        sys.exit(f"{cfg.toppar} lacks {', '.join(missing)} - run toppar_prepare.py")
     if shutil.which(cfg.pdb2pqr) is None:
         sys.exit(f"pdb2pqr executable '{cfg.pdb2pqr}' not found")
 
