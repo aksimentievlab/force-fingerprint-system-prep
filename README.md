@@ -1,4 +1,4 @@
-# AlphaFold -> CHARMM/NAMD system preparation
+# AlphaFold → CHARMM/NAMD system preparation
 
 Two scripts turn AlphaFold models into simulation-ready CHARMM36 systems for NAMD:
 
@@ -150,7 +150,7 @@ extraBondsFile metal_extrabonds.txt
 ```
 
 Minimize first, because psfgen guesses the hydrogen positions.
-Then release positional restraints in stages: heavy atoms, then backbone, then C_alpha.
+Then release positional restraints in stages: heavy atoms, then backbone, then Cα.
 
 ---
 
@@ -236,7 +236,7 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 
 **2. Cofactors and other ligands from AlphaFill.**
 
-- **Moving ligands onto your model.** Transplanted ligands are moved onto *your* model by superposing the C_alpha atoms within 10 Å of each ligand.
+- **Moving ligands onto your model.** Transplanted ligands are moved onto *your* model by superposing the Cα atoms within 10 Å of each ligand.
   A ligand is transferred only if:
   - the local backbone fit is ≤ 1.0 Å;
   - the pocket's heavy atoms, including side chains, agree within ≤ 1.5 Å (pocket = residues near the ligand in either structure;
@@ -253,6 +253,9 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
   the only difference is the reporting: an annotated cofactor whose site stays empty is flagged REVIEW,
   any other ligand left out is noted as INFO.
 - **Reporting.**
+  - Generic UniProt ligand names such as "substrate", "a protein" or "DNA" are ignored
+  (`IGNORED_LIGAND_NAMES` in `af_prep.py`, extended with `--ignore-ligand`);
+  a name given with `--name-map` is never ignored.
   - Transplants UniProt doesn't mention (crystallization additives and the like) are summarized in one line.
   - A transplant in an annotated site whose UniProt name has no code mapping is flagged REVIEW, with the `--name-map` fix spelled out.
 
@@ -346,6 +349,7 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 | `--no-uniprot` | | skip UniProt; with the binding-site rule, no cofactors are kept |
 | `--name-map NAME=CODE` | | map a UniProt ligand name to a PDB code (repeatable) |
 | `--keep-ligands A,B` | | extra PDB codes to allow |
+| `--ignore-ligand NAME` | | UniProt ligand name to ignore, in addition to `IGNORED_LIGAND_NAMES` (repeatable) |
 
 **AlphaFill**
 

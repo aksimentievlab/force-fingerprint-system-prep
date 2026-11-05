@@ -105,6 +105,16 @@ LIGAND_NAME_TO_CCD = {
     "4-amino-5-hydroxymethyl-2-methylpyrimidine": ["HMH"],
 }
 
+# UniProt ligand names to ignore entirely: generic or non-specific names that
+# cannot be mapped to one molecule.  Binding sites and cofactor comments with
+# these names are skipped (no REVIEW flags, nothing kept).  Extend with
+# --ignore-ligand; a name given with --name-map is never ignored.
+IGNORED_LIGAND_NAMES = {
+    "substrate", "product", "a protein", "DNA", "RNA", "tRNA", "mRNA", "rRNA",
+    "chitin", "peptidoglycan", "a carbohydrate", "a beta-lactam", "an acyl-CoA",
+    "an L-alpha-amino acid", "a 2'-deoxyribonucleoside 5'-triphosphate", "pyridine",
+}
+
 # PDB-code -> CHARMM aliases and UniProt state -> CHARMM residue come from the
 # toppar folder (ccd_aliases.json, uniprot_states.json, written by
 # toppar_prepare.py), so they always match the topologies psfgen will load.
@@ -356,11 +366,18 @@ def parse_uniprot(d):
     return info
 
 
-def allowed_ligands(uni, extra, rep):
+def allowed_ligands(uni, extra, ignore, rep):
     """CCD codes to keep, binding-site residues per CCD code, and binding-site
-    residues of UniProt ligand names that have no CCD mapping."""
+    residues of UniProt ligand names that have no CCD mapping.  Names in `ignore`
+    (normalised) are skipped."""
     allowed = set(extra)
     expected = set()
+    ignored = sorted({n for n in uni["cofactors"] + [x["ligand"] for x in uni["sites"]]
+                      if norm_name(n) in ignore})
+    if ignored:
+        rep.info(f"ignored UniProt ligand names: {', '.join(ignored)}")
+    uni = dict(uni, cofactors=[n for n in uni["cofactors"] if norm_name(n) not in ignore],
+               sites=[x for x in uni["sites"] if norm_name(x["ligand"]) not in ignore])
     for name in uni["cofactors"]:
         ccds = NAME_TO_CCD_NORM.get(norm_name(name))
         if ccds:
@@ -1299,7 +1316,7 @@ def process(model, cfg):
             elif m["type"] == "Glycosylation":
                 rep.info(f"glycosylation at {m['pos']}: {m['desc']} (not modelled)")
     allowed, expected, site_res, unmapped, site_names = (
-        allowed_ligands(uni, cfg.keep_ligands, rep) if uni
+        allowed_ligands(uni, cfg.keep_ligands, cfg.ignore_names, rep) if uni
         else (set(cfg.keep_ligands), set(), {}, {}, {}))
 
     # --- 2. AlphaFill
@@ -1495,6 +1512,9 @@ def main(argv=None):
     p.add_argument("--name-map", action="append", default=[], metavar="NAME=CCD",
                    help="map a UniProt ligand name to a CCD code, e.g. \"ATP=ATP\" "
                         "(repeatable)")
+    p.add_argument("--ignore-ligand", action="append", default=[], metavar="NAME",
+                   help="UniProt ligand name to ignore, in addition to IGNORED_LIGAND_NAMES "
+                        "(repeatable)")
     p.add_argument("--keep-ligands", default="",
                    help="extra CCD codes to keep, comma-separated (e.g. ATP,ADP)")
     p.add_argument("--plddt", type=float, default=50.0, help="terminal trim threshold")
@@ -1558,6 +1578,9 @@ def main(argv=None):
                             (m.rsplit("=", 1) for m in cfg.name_map))
     except ValueError:
         sys.exit("--name-map expects NAME=CCD")
+    # names given explicitly with --name-map are never ignored
+    cfg.ignore_names = ({norm_name(n) for n in IGNORED_LIGAND_NAMES | set(cfg.ignore_ligand)}
+                        - {norm_name(n) for n in cfg.name_map})
     logging.basicConfig(level=logging.INFO if cfg.verbose else logging.WARNING,
                         format="%(levelname)s %(message)s")
     Path(cfg.outdir).mkdir(parents=True, exist_ok=True)
