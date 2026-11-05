@@ -57,40 +57,52 @@ WATER_NAMES = {"HOH", "WAT", "DOD", "TIP3", "TP3M", "TIP", "SOL", "H2O"}  # TP3M
 METAL_ELEMENTS = {"ZN", "MG", "CA", "MN", "FE", "CU", "NI", "CO", "CD", "NA",
                   "K", "HG", "MO", "W"}
 
-# UniProt cofactor / binding-site ligand names -> PDB CCD codes.
-# Matching is case- and whitespace-insensitive. Unmapped *cofactor* names are
-# flagged REVIEW so you can extend this table.
-COFACTOR_NAME_TO_CCD = {
+# UniProt ligand names (cofactor comments and binding-site features) -> PDB CCD
+# codes.  Matching is case- and whitespace-insensitive.  Every ligand kept must
+# fit its pocket in the model (see select_ligands); whether a ligand is a cofactor
+# (named in a UniProt cofactor comment) only decides how a failure is reported.
+# Unmapped *cofactor* names are flagged REVIEW so you can extend this table.
+LIGAND_NAME_TO_CCD = {
+    # metal ions
     "Zn(2+)": ["ZN"], "Mg(2+)": ["MG"], "Ca(2+)": ["CA"], "Mn(2+)": ["MN"],
     "Fe(2+)": ["FE2", "FE"], "Fe(3+)": ["FE", "FE2"], "Fe cation": ["FE", "FE2"],
     "Cu(2+)": ["CU"], "Cu(+)": ["CU1", "CU"], "Cu cation": ["CU", "CU1"],
     "Ni(2+)": ["NI"], "Co(2+)": ["CO"], "Cd(2+)": ["CD"],
-    "K(+)": ["K"], "Na(+)": ["NA"],
+    "K(+)": ["K"], "Na(+)": ["NA"], "chloride": ["CL"],
+    "a divalent metal cation": ["MG", "MN", "ZN", "CO", "NI", "FE2", "CA", "CU"],
+    # hemes, flavins, nicotinamides (reduced forms: accept either code)
     "heme": ["HEM", "HEC"], "heme b": ["HEM"], "heme c": ["HEC"],
     "FAD": ["FAD", "FDA"], "FMN": ["FMN", "FNR"], "NAD(+)": ["NAD", "NAI"],
     "NADP(+)": ["NAP", "NDP"],
     "NADH": ["NAI", "NAD"], "NADPH": ["NDP", "NAP"],
-    "FADH2": ["FDA", "FAD"], "FMNH2": ["FNR", "FMN"],   # reduced: accept either code
+    "FADH2": ["FDA", "FAD"], "FMNH2": ["FNR", "FMN"],
+    # other cofactors
     "pyridoxal 5'-phosphate": ["PLP"], "thiamine diphosphate": ["TPP"],
     "[4Fe-4S] cluster": ["SF4"], "[2Fe-2S] cluster": ["FES"],
-    "[3Fe-4S] cluster": ["F3S"], "Mo-molybdopterin": ["MTE"],
-    "biotin": ["BTN"], "coenzyme A": ["COA"],
-    # cofactors seen in the dataset
-    "chloride": ["CL"],                                   # CHARMM: CLA
-    "a divalent metal cation": ["MG", "MN", "ZN", "CO", "NI", "FE2", "CA", "CU"],
-    "O2": ["OXY"],                                        # CHARMM: O2
-    "ATP": ["ATP"],                                       # CHARMM: ATP
-    "S-adenosyl-L-methionine": ["SAM"],                   # CHARMM: SAM
-    "S-adenosyl-L-homocysteine": ["SAH"],                 # CHARMM: SAH
-    "(6S)-5,6,7,8-tetrahydrofolate": ["THG"],             # CHARMM: THG
-    "CoA": ["COA"],
-    "acetyl-CoA": ["ACO"],
-    "glutathione": ["GSH"],
-    "L-ascorbate": ["ASC"],
-    "(R)-lipoate": ["LPA"],
-    "cob(II)alamin": ["B12"],
-    "(6R)-5,10-methylene-5,6,7,8-tetrahydrofolate": ["MHF"],   # verify, see below
-    "hybrid [4Fe-2O-2S] cluster": ["FSO"],                     # verify, see below
+    "[3Fe-4S] cluster": ["F3S"], "hybrid [4Fe-2O-2S] cluster": ["FSO"],   # verify FSO
+    "Mo-molybdopterin": ["MTE"], "biotin": ["BTN"], "coenzyme A": ["COA"],
+    "CoA": ["COA"], "acetyl-CoA": ["ACO"], "glutathione": ["GSH"],
+    "S-adenosyl-L-methionine": ["SAM"], "S-adenosyl-L-homocysteine": ["SAH"],
+    "(6S)-5,6,7,8-tetrahydrofolate": ["THG"],
+    "(6R)-5,10-methylene-5,6,7,8-tetrahydrofolate": ["MHF"],             # verify MHF
+    "L-ascorbate": ["ASC"], "(R)-lipoate": ["LPA"], "cob(II)alamin": ["B12"],
+    "O2": ["OXY"],
+    # nucleotides (CCD GMP is guanosine and CMP is cyclic AMP - hence 5GP, C5P)
+    "ATP": ["ATP"], "ADP": ["ADP"], "AMP": ["AMP"],
+    "GTP": ["GTP"], "GDP": ["GDP"], "GMP": ["5GP"],
+    "CTP": ["CTP"], "CDP": ["CDP"], "CMP": ["C5P"],
+    "UTP": ["UTP"], "UDP": ["UDP"],
+    # substrates / metabolites
+    "2-oxoglutarate": ["AKG"], "succinate": ["SIN"], "phosphoenolpyruvate": ["PEP"],
+    "3-phosphoshikimate": ["S3P"], "isochorismate": ["ISC"],
+    "(2E,6E)-farnesyl diphosphate": ["FPP"], "(2E)-geranyl diphosphate": ["GPP"],
+    "dimethylallyl diphosphate": ["DMA"], "isopentenyl diphosphate": ["IPE"],
+    "3'-phosphoadenylyl sulfate": ["PPS"], "UDP-alpha-D-glucose": ["UPG"],
+    "dTDP-beta-L-rhamnose": ["TRH"], "GDP-beta-L-fucose": ["GFB"],
+    "all-trans-retinoate": ["REA"], "quercetin": ["QUE"],
+    "(2R)-3-phosphoglycerate": ["3PG"], "nicotinamide": ["NCA"],
+    "adenosine": ["ADN"], "streptomycin": ["SRY"],
+    "4-amino-5-hydroxymethyl-2-methylpyrimidine": ["HMH"],
 }
 
 # PDB-code -> CHARMM aliases and UniProt state -> CHARMM residue come from the
@@ -98,7 +110,7 @@ COFACTOR_NAME_TO_CCD = {
 # toppar_prepare.py), so they always match the topologies psfgen will load.
 
 # Ligands that need bonded models / special parameters in any case.
-NEEDS_BONDED = {"SF4", "FES", "F3S", "HEC"}
+NEEDS_BONDED = {"SF4", "FES", "F3S", "FSO", "HEC"}
 COVALENT_HINTS = ("pyridoxal", "heme", "flavin", "fad", "fmn", "lipoyl",
                   "biotin", "phosphopantetheine", "retinal")
 
@@ -270,7 +282,7 @@ def norm_name(s):
     return re.sub(r"\s+", "", (s or "").lower())
 
 
-NAME_TO_CCD_NORM = {norm_name(k): v for k, v in COFACTOR_NAME_TO_CCD.items()}
+NAME_TO_CCD_NORM = {norm_name(k): v for k, v in LIGAND_NAME_TO_CCD.items()}
 
 
 def accession_from_name(path):
@@ -356,7 +368,7 @@ def allowed_ligands(uni, extra, rep):
             expected.add(tuple(ccds))
         else:
             rep.review(f"UniProt cofactor '{name}' has no CCD mapping; extend "
-                       "COFACTOR_NAME_TO_CCD")
+                       "LIGAND_NAME_TO_CCD")
     # site_res[ccd][label] = residue numbers. UniProt labels distinguish several
     # copies of the same ligand ("1", "2"); unlabelled features form one site.
     site_res, unmapped, site_names = {}, {}, {}
@@ -518,9 +530,11 @@ def transplant_ligands(ligs, af_protein, protein, cfg, rep):
     return out, metrics
 
 
-def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd, cfg, rep):
-    """Keep only ligands that touch a UniProt binding-site residue for that
-    ligand, at most one copy per annotated site per chain, no clashes/overlaps."""
+def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
+                   cofactor_ccds, cfg, rep):
+    """Keep ligands that sit in a UniProt-annotated binding site for that ligand
+    and fit the model's pocket (no clashes, buried, covering the site), at most
+    one copy per site and chain."""
     from collections import Counter
     ph = heavy(protein)
     tree = cKDTree(coords(ph))
@@ -553,9 +567,10 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd, cfg,
         d, _ = tree.query(xyz)
         metal = len(la) == 1 and la[0].element in METAL_ELEMENTS
         clashes = int(np.sum(d < (cfg.metal_clash if metal else cfg.clash)))
+        burial = float(np.mean(d <= cfg.burial_dist))
         near = {(ph[i].chain, ph[i].resnum)
                 for lst in tree.query_ball_point(xyz, cfg.site_contact) for i in lst}
-        # contacts per annotated site, per chain (homomers: each chain has the site)
+        # coverage of each annotated site, per chain (homomers: each chain has it)
         touched = {}
         for (ch, rn) in near:
             for label, res in groups.items():
@@ -564,50 +579,64 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd, cfg,
         if not touched:
             rep.info(f"dropped {tag} (touches no annotated binding-site residue)")
             continue
+        coverage = {k: n / len(groups[k[1]]) for k, n in touched.items()}
         cands.append(dict(key=key, ccd=ccd, atoms=atoms, xyz=xyz, metal=metal,
-                          clashes=clashes, touched=touched, tag=tag,
-                          annotated=max(touched.values())))
+                          clashes=clashes, burial=burial, coverage=coverage, tag=tag,
+                          cofactor=ccd in cofactor_ccds))
     if not_in_uniprot:
         rep.info("dropped AlphaFill ligands not mentioned in UniProt: " +
                  ", ".join(f"{c} x{n}" for c, n in not_in_uniprot.most_common()))
     for (name, ccd), n in sorted(unmapped_hits.items()):
         rep.review(f"{n} AlphaFill {ccd} copy(ies) sit in the UniProt binding site for "
                    f"'{name}', which has no CCD mapping - to keep them, run with "
-                   f"--name-map \"{name}={ccd}\" (or add it to COFACTOR_NAME_TO_CCD)")
+                   f"--name-map \"{name}={ccd}\" (or add it to LIGAND_NAME_TO_CCD)")
     for ccd in sorted(no_sites):
-        rep.review(f"{ccd} is an annotated cofactor but UniProt gives no binding-site "
-                   "residues for it; no copy kept (place it manually if needed)")
+        (rep.review if ccd in cofactor_ccds else rep.info)(
+            f"{ccd} is annotated in UniProt but without binding-site residues; no copy "
+            "kept (place it manually if needed)")
 
-    # best-placed copies first: no clashes, then most site contacts
-    def limit(c):
-        return 0 if c["metal"] else cfg.max_clash
-    cands.sort(key=lambda c: (c["clashes"] > limit(c), -c["annotated"], c["clashes"]))
+    # Fit tests on the model's pocket: a pocket that is apo-like (collapsed or
+    # opened up) shows up as clashes, low burial or low coverage of the site.
+    def failures(c, cov):
+        f = []
+        if c["clashes"] > cfg.max_clash:
+            f.append(f"{c['clashes']} clashing atoms")
+        if c["burial"] < cfg.min_burial:
+            f.append(f"burial {c['burial']:.0%}")
+        if cov < cfg.min_site_coverage:
+            f.append(f"site coverage {cov:.0%}")
+        return f
+
+    # best-fitting copies first
+    cands.sort(key=lambda c: (bool(failures(c, max(c["coverage"].values()))),
+                              -max(c["coverage"].values()), c["clashes"]))
     kept, filled, best_reject = [], set(), {}
     for c in cands:
-        site_keys = [(c["ccd"], ch, lb) for (ch, lb) in c["touched"]]
-        if c["clashes"] > limit(c):
-            for sk in site_keys:
-                best_reject.setdefault(sk, c["clashes"])
-            rep.info(f"dropped {c['tag']} ({c['clashes']} clashing atoms)")
-            continue
-        open_sites = [sk for sk in site_keys if sk not in filled]
+        open_sites = [k for k in c["coverage"] if (c["ccd"],) + k not in filled]
         if not open_sites:
             rep.info(f"dropped {c['tag']} (site already has a better-placed copy)")
+            continue
+        site = max(open_sites, key=lambda k: c["coverage"][k])
+        cov = c["coverage"][site]
+        fail = failures(c, cov)
+        if fail:
+            for k in c["coverage"]:
+                best_reject.setdefault((c["ccd"],) + k, ", ".join(fail))
+            rep.info(f"dropped {c['tag']} (does not fit the model's pocket: "
+                     f"{', '.join(fail)})")
             continue
         if any(np.min(np.linalg.norm(c["xyz"][:, None] - k["xyz"][None], axis=2))
                < cfg.overlap for k in kept):
             rep.info(f"dropped {c['tag']} (overlaps a kept ligand)")
             continue
-        # claim the open site this copy contacts most
-        sk = max(open_sites, key=lambda k: c["touched"][(k[1], k[2])])
-        filled.add(sk)
-        c["site_label"] = sk[2]
+        filled.add((c["ccd"],) + site)
+        c["site_label"] = site[1]
         kept.append(c)
-        label = f" site {sk[2]}" if sk[2] else ""
+        label = f" site {site[1]}" if site[1] else ""
         fit = fit_rmsd.get(c["key"])
         fit = f", {fit}" if fit else ""
-        rep.info(f"kept {c['tag']} at chain {sk[1]}{label} "
-                 f"(clashes={c['clashes']}, site contacts={c['annotated']}{fit})")
+        rep.info(f"kept {c['tag']} at chain {site[0]}{label} (burial {c['burial']:.0%}, "
+                 f"site coverage {cov:.0%}, clashes {c['clashes']}{fit})")
 
     # annotated sites (per chain) that ended up without a ligand
     for ccd, groups in site_res.items():
@@ -618,12 +647,15 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd, cfg,
                 sk = (ccd, ch, label)
                 if sk in filled:
                     continue
-                why = (f"best copy had {best_reject[sk]} clashing atoms"
+                why = (f"best copy did not fit: {best_reject[sk]}"
                        if sk in best_reject else "no transplanted copy touches it"
                        + ("; some were not transferred, see INFO" if fit_rmsd is not None
                           and getattr(cfg, "_transfer_drops", False) else ""))
                 lb = f" site {label}" if label else ""
-                rep.review(f"{ccd} binding site{lb} in chain {ch} left empty ({why})")
+                msg = f"{ccd} binding site{lb} in chain {ch} left empty ({why})"
+                # an annotated cofactor missing is a problem; a substrate left out
+                # of an apo-like pocket is expected
+                (rep.review if ccd in cofactor_ccds else rep.info)(msg)
     return kept
 
 
@@ -1296,8 +1328,9 @@ def process(model, cfg):
     orig_resname = {(a.chain, a.resnum): ("HIS" if a.resname in ("HSD", "HSE", "HSP")
                                           else a.resname) for a in protein}
 
-    ligands = (select_ligands(protein, ligs, allowed, site_res, unmapped, fit_rmsd, cfg, rep)
-               if ligs else [])
+    cofactor_ccds = {c for ccds in expected for c in ccds}
+    ligands = (select_ligands(protein, ligs, allowed, site_res, unmapped, fit_rmsd,
+                              cofactor_ccds, cfg, rep) if ligs else [])
     for lig in ligands:                           # UniProt names of the site each one fills
         names = site_names.get(lig["ccd"], {})
         lig["uniprot"] = sorted(names.get(lig["site_label"], set())
@@ -1468,7 +1501,14 @@ def main(argv=None):
     p.add_argument("--trim-window", type=int, default=3)
     p.add_argument("--clash", type=float, default=2.2)
     p.add_argument("--metal-clash", type=float, default=1.6)
-    p.add_argument("--max-clash", type=int, default=2)
+    p.add_argument("--max-clash", type=int, default=0,
+                   help="ligand heavy atoms allowed closer than --clash to the protein")
+    p.add_argument("--burial-dist", type=float, default=4.0,
+                   help="a ligand atom is buried if a protein heavy atom is this close (A)")
+    p.add_argument("--min-burial", type=float, default=0.5,
+                   help="minimum fraction of buried ligand heavy atoms")
+    p.add_argument("--min-site-coverage", type=float, default=0.5,
+                   help="minimum fraction of the annotated site residues the ligand contacts")
     p.add_argument("--site-contact", type=float, default=4.0,
                    help="ligand-to-binding-site-residue contact distance (A)")
     p.add_argument("--overlap", type=float, default=2.0,

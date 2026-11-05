@@ -69,7 +69,8 @@ Optional extra: `parmed`, used only by `toppar_prepare.py --verify`.
 
 **VMD** (1.9.4 or later), with the psfgen, solvate and autoionize plugins it ships with.
 It must be on `PATH` as `vmd`, or passed with `--vmd`.
-It is run in text mode; no display is needed.
+It is run in text mode;
+no display is needed.
 
 **Dowser++**, for internal waters.
 Run the install script **from the `extern` directory**:
@@ -117,8 +118,7 @@ python af_prep.py filtered_dataset/filtered_mf/structures/*.pdb \
     -j 64 -v
 ```
 
-**Quick test on one structure.** Leave out `--dowser-dir` and `--run-vmd`, 
-then inspect `report.txt` and `build/build.tcl` before running the full set:
+**Quick test on one structure.** Leave out `--dowser-dir` and `--run-vmd`, then inspect `report.txt` and `build/build.tcl` before running the full set:
 
 ```bash
 python af_prep.py filtered_dataset/filtered_mf/structures/SOME_PROTEIN.pdb \
@@ -227,61 +227,62 @@ Use `--extra-stream` to add any of them.
 
 ### Pipeline (per model)
 
-**1.
-Accession and UniProt.** The UniProt accession is read from the PDB header (`DBREF`, or the accession in `TITLE`), or from mmCIF `_struct_ref`, with an `AF-<acc>-F<n>` file name as fallback.
+**1. Accession and UniProt.** The UniProt accession is read from the PDB header (`DBREF`, or the accession in `TITLE`), or from mmCIF `_struct_ref`, with an `AF-<acc>-F<n>` file name as fallback.
 The UniProt entry (cached in `<outdir>/cache`) supplies:
 - cofactors;
 - binding sites (with ligand names and labels);
 - the mature chain boundaries;
 - modified residues: covalent cofactors and glycosylation are flagged.
 
-**2.
-Cofactors from AlphaFill.**
+**2. Cofactors and other ligands from AlphaFill.**
 
-- **Moving ligands onto your model.** Transplanted ligands are moved onto *your* model by superposing the Cα atoms within 10 Å of each ligand.
+- **Moving ligands onto your model.** Transplanted ligands are moved onto *your* model by superposing the C_alpha atoms within 10 Å of each ligand.
   A ligand is transferred only if:
   - the local backbone fit is ≤ 1.0 Å;
   - the pocket's heavy atoms, including side chains, agree within ≤ 1.5 Å (pocket = residues near the ligand in either structure;
     symmetric Asp/Glu/Phe/Tyr/Arg atoms are handled);
   - your model keeps ≥ 70% of the ligand–protein contacts AlphaFill had.
-- **Selecting what to keep.** A ligand is kept only if it touches a binding-site residue that UniProt annotates for that ligand.
-  At most one copy is kept per annotated site and chain, and copies that clash or overlap are dropped.
+- **Selecting what to keep.** A ligand is kept only if it touches a binding-site residue that UniProt annotates for that ligand, and it fits your model's pocket:
+  - no ligand heavy atom closer than 2.2 Å to a protein heavy atom (1.6 Å for metal ions);
+  - at least 50% of its heavy atoms buried (a protein heavy atom within 4 Å);
+  - contact with at least 50% of the residues UniProt annotates for the site.
+
+  An apo-like pocket, collapsed or opened up, fails these tests.
+  At most one copy is kept per annotated site and chain.
+  The same tests apply to cofactors and to other annotated ligands (substrates, nucleotides);
+  the only difference is the reporting: an annotated cofactor whose site stays empty is flagged REVIEW,
+  any other ligand left out is noted as INFO.
 - **Reporting.**
   - Transplants UniProt doesn't mention (crystallization additives and the like) are summarized in one line.
   - A transplant in an annotated site whose UniProt name has no code mapping is flagged REVIEW, with the `--name-map` fix spelled out.
 
-**3.
-Trimming.**
+**3. Trimming.**
 - Residues outside UniProt's mature chain are removed: signal peptide, propeptides, initiator Met.
 - Disordered termini are trimmed by pLDDT (`--plddt`, `--trim-window`).
 - Residue numbering stays UniProt numbering.
 - Native termini get NTER/CTER (PROP/GLYP for an N-terminal Pro/Gly).
   Termini created by trimming get neutral caps, ACE/ACP and CT3.
 
-**4.
-Internal waters (Dowser++, optional).**
+**4. Internal waters (Dowser++, optional).**
 - Dowser++ runs on the trimmed protein plus cofactors.
   If that fails, it is retried protein-only.
 - Each model runs in its own temporary copy of the Dowser++ folder, so `-j` is safe.
 - Waters overlapping protein, cofactors or each other are dropped.
   The rest are renumbered in chain W.
 
-**5.
-Protonation.**
+**5. Protonation.**
 - PDB2PQR with PROPKA, at `--ph`.
 - States are read from the hydrogens PDB2PQR adds: HSD/HSE/HSP, ASPP, GLUP, LSN.
 - PDB2PQR's coordinates are kept, including its Asn/Gln/His flips.
 - Residues with pKa near the pH, and titratable residues next to a cofactor (PROPKA doesn't see cofactors), are reported.
 
-**6.
-Metal sites and disulfides.**
+**6. Metal sites and disulfides.**
 - Residues coordinating a metal are overridden: His tautomer from the coordinating nitrogen, Asp/Glu deprotonated, Cys deprotonated (`--cys-deprot-patch`, default `CYSD`).
 - A His bonded to a heme iron gets the PHEM patch.
 - Metal–ligand distances are written as NAMD extraBonds restraints.
 - Disulfides are found by SG–SG distance and cross-checked against PDB2PQR's own detection.
 
-**7.
-Build.**
+**7. Build.**
 
 - **Topologies.** `build/build.tcl` loads the topologies via `load_psfgen.tcl`.
 - **Protein and patches.** It builds one segment per chain (`PRO<chain>`) and applies the protonation, disulfide and terminal patches.
@@ -323,7 +324,7 @@ Build.**
 |---|---|
 | AlphaFill ligand sits in a UniProt site with no code mapping | add `--name-map "NAME=CODE"` if you want it |
 | cofactor NOT built (no matching RESI) | add its topology (e.g. CGenFF via `toppar_prepare.py --extra-stream`) or an alias in `CCD_ALIASES` |
-| annotated cofactor not placed / binding site left empty | AlphaFill had no acceptable copy; consider a homolog structure or co-folding |
+| annotated cofactor not placed / cofactor binding site left empty | AlphaFill had no copy that fits the model's pocket (the reason is given); consider a homolog structure or co-folding |
 | UniProt suggests a state that isn't available | the cofactor was built from its PDB code; check its charge/redox state |
 | residue within 4.5 Å of a cofactor | its protonation was computed without the cofactor; check it |
 | covalent cofactor/modification | needs a custom patch (e.g. PLP–Lys) |
@@ -359,7 +360,9 @@ Build.**
 | `--contact-dist` | 4 Å | contact distance for `--min-contact-frac` |
 | `--min-contact-frac` | 0.7 | minimum fraction of AlphaFill's contacts kept |
 | `--site-contact` | 4 Å | ligand–binding-site contact distance |
-| `--clash`, `--metal-clash`, `--max-clash` | 2.2 Å, 1.6 Å, 2 | clash criteria |
+| `--clash`, `--metal-clash`, `--max-clash` | 2.2 Å, 1.6 Å, 0 | clash distance and number of clashing atoms allowed |
+| `--burial-dist`, `--min-burial` | 4 Å, 0.5 | fraction of ligand atoms that must be buried |
+| `--min-site-coverage` | 0.5 | fraction of the annotated site residues the ligand must contact |
 | `--overlap` | 2 Å | ligand copies closer than this occupy the same site |
 
 **Trimming, protonation, metals, disulfides**
