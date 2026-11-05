@@ -53,7 +53,7 @@ ALPHAFILL_URL = "https://alphafill.eu/v1/aff/{acc}"
 
 AA3 = {"ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
        "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"}
-WATER_NAMES = {"HOH", "WAT", "DOD", "TIP3", "TIP", "SOL", "H2O"}
+WATER_NAMES = {"HOH", "WAT", "DOD", "TIP3", "TP3M", "TIP", "SOL", "H2O"}  # TP3M: PDB2PQR
 METAL_ELEMENTS = {"ZN", "MG", "CA", "MN", "FE", "CU", "NI", "CO", "CD", "NA",
                   "K", "HG", "MO", "W"}
 
@@ -699,7 +699,10 @@ def _dowser_waters(path):
             continue
         if a.element == "O" and (is_water(a) or a.name in ("O", "OW", "OH2")):
             out.append(a)
-    return out
+    # Dowser++ numbers its waters 1..N in chain A: give them their own chain so
+    # they can never be confused with protein residues of the same number
+    return [replace(a, chain="W", resnum=i, icode="", resname="HOH")
+            for i, a in enumerate(out, 1)]
 
 
 def run_dowser(protein, lig_atoms, outdir, cfg, rep):
@@ -806,7 +809,8 @@ def run_pdb2pqr(protein, waters, workdir, cfg, rep):
     wd = (Path(workdir) / "pdb2pqr").resolve()
     wd.mkdir(exist_ok=True)
     inp = wd / "p2p_in.pdb"
-    wat = [replace(w, record="HETATM", resname="HOH", name="O") for w in waters]
+    wat = [replace(w, record="HETATM", resname="HOH", name="O", chain="W", resnum=i)
+           for i, w in enumerate(waters, 1)]
     write_pdb(heavy(protein) + wat, inp)
     out_pdb, out_pqr = wd / "p2p_out.pdb", wd / "p2p_out.pqr"
     cmd = [cfg.pdb2pqr, "--ff=CHARMM", "--ffout=CHARMM",
@@ -1296,10 +1300,10 @@ def process(model, cfg):
     # --- 5. PDB2PQR
     p2p_atoms, pkas, p2p_disu = run_pdb2pqr(protein, waters, outdir, cfg, rep)
     p2p_prot = [a for a in p2p_atoms if (a.chain, a.resnum) in orig_resname
-                and not is_water(a)]
+                and a.chain != "W" and not is_water(a)]
     missing = set(orig_resname) - {(a.chain, a.resnum) for a in p2p_prot}
     if missing:
-        raise RuntimeError(f"PDB2PQR dropped residues: {sorted(missing)[:10]}{'...' if len(missing) > 3 else ''}")
+        raise RuntimeError(f"PDB2PQR dropped residues: {sorted(missing)[:10]}")
     states, free_cys = decode_states([a for a in p2p_prot if a.is_h],
                                      orig_resname, rep)
     prot_heavy = heavy(p2p_prot)   # PDB2PQR coordinates include its NQH flips
@@ -1388,9 +1392,9 @@ def process(model, cfg):
     bd = build_files(name, outdir, prot_heavy, orig_resname, termini, states,
                      patches, ss, ligands, waters, phem, extrabonds, cfg, rep)
     if cfg.run_vmd:
-        r = subprocess.run([cfg.vmd, "-dispdev", "text", "-e", "build.tcl"],
+        r = subprocess.run([cfg.vmd, "-dispdev", "text"],
                            cwd=bd, capture_output=True, text=True,
-                           stdin=subprocess.DEVNULL, timeout=cfg.vmd_timeout)
+                           input=(bd/"build.tcl").read_text(), timeout=cfg.vmd_timeout)
         (bd / "vmd.log").write_text(r.stdout + r.stderr)
         if not (bd / f"{name}.psf").exists():
             rep.review("VMD/psfgen build did not produce a PSF; see build/vmd.log")
@@ -1510,7 +1514,8 @@ def main(argv=None):
         cfg.dowser_dir = d
     missing = [f for f in TOPPAR_FILES if not (Path(cfg.toppar) / f).exists()]
     if missing:
-        sys.exit(f"{cfg.toppar} lacks {', '.join(missing)} - run toppar_prepare.py")
+        sys.exit(f"{cfg.toppar} lacks {', '.join(missing)} - run toppar_prepare.py "
+                 "(a version that writes ccd_aliases.json and uniprot_states.json)")
     if shutil.which(cfg.pdb2pqr) is None:
         sys.exit(f"pdb2pqr executable '{cfg.pdb2pqr}' not found")
 

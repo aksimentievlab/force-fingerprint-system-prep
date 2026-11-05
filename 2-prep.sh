@@ -9,9 +9,7 @@ uvr af_prep.py filtered_dataset/filtered_mf/structures/*.pdb \
     --outdir 2-prep \
     --ph 7.0 \
     --alphafill auto \
-    --toppar toppar/top_all36_prot.rtf \
-             toppar/toppar_water_ions.str.vmd \
-             toppar/toppar_all36_prot_heme.str \
+    --toppar ./toppar \
     --solvate --padding 16 --salt 0.15 \
     --dowser-dir $(pwd)/extern/dowserplusplus \
     --dowser-path "$(dirname $(micromamba run -n dpfunc which R))" \
