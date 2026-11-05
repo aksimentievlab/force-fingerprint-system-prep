@@ -1,0 +1,15 @@
+# environment.yml
+name: dpfunc
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - numpy
+  - scipy
+  - networkx
+  - gemmi
+  - requests
+  - r-base          # Dowser++ (water clustering step)
+  - pip
+  - pip:
+      - pdb2pqr>=3.6.2   # also installs propka
