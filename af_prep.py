@@ -16,7 +16,8 @@ Pipeline, per model (order matters):
 Anything a human should look at is flagged REVIEW in <outdir>/<model>/report.txt
 and summarised in <outdir>/summary.tsv.
 
-Requirements: python>=3.8, numpy, scipy, networkx, gemmi, requests, pdb2pqr (CLI).
+Requirements: python>=3.8, numpy, scipy, networkx, gemmi, requests, pdb2pqr (CLI);
+tqdm (optional, progress bars).
 Optional: VMD (to run the generated build script); Dowser++ for internal waters.
 
 Example:
@@ -40,6 +41,12 @@ from pathlib import Path
 
 import numpy as np
 from scipy.spatial import cKDTree
+
+try:                                   # progress bars are optional
+    from tqdm import tqdm
+    from tqdm.contrib.logging import logging_redirect_tqdm
+except ImportError:                    # pragma: no cover
+    tqdm = None
 
 log = logging.getLogger("af_prep")
 
@@ -1364,12 +1371,18 @@ def prefetch(cfg):
                 a, i, cfg.alphafill_url, cfg.cache)
     if not jobs:
         return
-    log.warning("downloading %d UniProt/AlphaFill entries (%d at a time)",
-                len(jobs), cfg.max_downloads)
+    from concurrent.futures import as_completed
+    if tqdm is None:
+        log.warning("downloading %d UniProt/AlphaFill entries (%d at a time)",
+                    len(jobs), cfg.max_downloads)
     failed = []
     with ThreadPoolExecutor(max_workers=cfg.max_downloads) as ex:
-        futures = {k: ex.submit(f) for k, f in jobs.items()}
-        for k, fut in futures.items():
+        futures = {ex.submit(f): k for k, f in jobs.items()}
+        done = as_completed(futures)
+        if tqdm is not None:
+            done = tqdm(done, total=len(futures), desc="downloads", unit="entry")
+        for fut in done:
+            k = futures[fut]
             try:
                 fut.result()
             except Exception as exc:  # noqa: BLE001
@@ -1592,7 +1605,7 @@ def main(argv=None):
     p.add_argument("--alphafill", default="auto",
                    help="'auto' (download), a directory of AlphaFill .cif files, or 'none'")
     p.add_argument("--alphafill-url", default=ALPHAFILL_URL)
-    p.add_argument("--max-downloads", type=int, default=4,
+    p.add_argument("--max-downloads", type=int, default=16,
                    help="parallel connections when downloading UniProt/AlphaFill entries")
     p.add_argument("--retries", type=int, default=6,
                    help="attempts per download (backoff 2, 4, 8, ... s with jitter)")
@@ -1702,16 +1715,26 @@ def main(argv=None):
 
     global HTTP_RETRIES
     HTTP_RETRIES = max(1, cfg.retries)
-    prefetch(cfg)
 
-    if cfg.jobs > 1:
-        # models are independent; each Dowser++ run uses its own copy of the
-        # Dowser++ folder, so they can run side by side (one core each)
-        from concurrent.futures import ProcessPoolExecutor
-        with ProcessPoolExecutor(max_workers=cfg.jobs) as ex:
-            rows = list(ex.map(_run_one, cfg.models, [cfg] * len(cfg.models)))
-    else:
-        rows = [_run_one(m, cfg) for m in cfg.models]
+    def bar(it, total, desc):
+        return tqdm(it, total=total, desc=desc, unit="model") if tqdm else it
+
+    from contextlib import nullcontext
+    with (logging_redirect_tqdm() if tqdm else nullcontext()):  # log lines above the bars
+        prefetch(cfg)
+        rows_by = {}
+        if cfg.jobs > 1:
+            # models are independent; each Dowser++ run uses its own copy of the
+            # Dowser++ folder, so they can run side by side (one core each)
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            with ProcessPoolExecutor(max_workers=cfg.jobs) as ex:
+                futs = {ex.submit(_run_one, m, cfg): m for m in cfg.models}
+                for fut in bar(as_completed(futs), len(futs), "models"):
+                    rows_by[futs[fut]] = fut.result()
+        else:
+            for m in bar(cfg.models, len(cfg.models), "models"):
+                rows_by[m] = _run_one(m, cfg)
+    rows = [rows_by[m] for m in cfg.models]
     with open(Path(cfg.outdir) / "summary.tsv", "w") as fh:
         fh.write("model\tstatus\tn_review\n")
         for r in rows:

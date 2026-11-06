@@ -1,4 +1,4 @@
-# AlphaFold → CHARMM/NAMD system preparation
+# AlphaFold -> CHARMM/NAMD system preparation
 
 Two scripts turn AlphaFold models into simulation-ready CHARMM36 systems for NAMD:
 
@@ -51,6 +51,7 @@ dependencies:
   - gemmi
   - requests
   - r-base          # Dowser++ (water clustering step)
+  - tqdm            # progress bars (optional)
   - pip
   - pip:
       - pdb2pqr>=3.6.2   # also installs propka
@@ -150,7 +151,7 @@ extraBondsFile metal_extrabonds.txt
 ```
 
 Minimize first, because psfgen guesses the hydrogen positions.
-Then release positional restraints in stages: heavy atoms, then backbone, then Cα.
+Then release positional restraints in stages: heavy atoms, then backbone, then C-alpha.
 
 ---
 
@@ -186,8 +187,8 @@ psfgen and NAMD can't interpret those commands, and naively splitting the files 
 | `topologies_psfgen.txt` | topology files in psfgen order (first definition wins) |
 | `topologies_charmm.txt` | topology files in CHARMM order (last wins), for CHARMM, ParmEd, OpenMM |
 | `parameters.txt` | parameter files in CHARMM order |
-| `ccd_aliases.json` | PDB ligand code → CHARMM residue names, e.g. `ZN`→`ZN2`, `HEM`→`HEME` |
-| `uniprot_states.json` | UniProt state name → CHARMM residue, e.g. `Fe(2+)`→`FE2P`, `NADH`→`NAI` |
+| `ccd_aliases.json` | PDB ligand code -> CHARMM residue names, e.g. `ZN` -> `ZN2`, `HEM` -> `HEME` |
+| `uniprot_states.json` | UniProt state name -> CHARMM residue, e.g. `Fe(2+)` -> `FE2P`, `NADH` -> `NAI` |
 | `toppar_prepare.log` | everything changed or worth knowing: duplicate residues, parameter overrides, CUFIX replacements, bond fixes |
 
 The two JSON tables are defined only in `toppar_prepare.py` (`CCD_ALIASES`, `UNIPROT_STATES`).
@@ -236,12 +237,12 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 
 **2. Cofactors and other ligands from AlphaFill.**
 
-- **Moving ligands onto your model.** Transplanted ligands are moved onto *your* model by superposing the Cα atoms within 10 Å of each ligand.
+- **Moving ligands onto your model.** Transplanted ligands are moved onto *your* model by superposing the C-alpha atoms within 10 Å of each ligand.
   A ligand is transferred only if:
-  - the local backbone fit is ≤ 1.0 Å;
-  - the pocket's heavy atoms, including side chains, agree within ≤ 1.5 Å (pocket = residues near the ligand in either structure;
+  - the local backbone fit is <= 1.0 Å;
+  - the pocket's heavy atoms, including side chains, agree within <= 1.5 Å (pocket = residues near the ligand in either structure;
     symmetric Asp/Glu/Phe/Tyr/Arg atoms are handled);
-  - your model keeps ≥ 70% of the ligand–protein contacts AlphaFill had.
+  - your model keeps >= 70% of the ligand-protein contacts AlphaFill had.
 - **Selecting what to keep.** A ligand is kept only if it touches a binding-site residue that UniProt annotates for that ligand, and it fits your model's pocket:
   - no ligand heavy atom closer than 2.2 Å to a protein heavy atom (1.6 Å for metal ions);
   - at least 50% of its heavy atoms buried (a protein heavy atom within 4 Å);
@@ -284,8 +285,8 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 **6. Metal sites and disulfides.**
 - Residues coordinating a metal are overridden: His tautomer from the coordinating nitrogen, Asp/Glu deprotonated, Cys deprotonated (`--cys-deprot-patch`, default `CYSD`).
 - A His bonded to a heme iron gets the PHEM patch.
-- Metal–ligand distances are written as NAMD extraBonds restraints.
-- Disulfides are found by SG–SG distance and cross-checked against PDB2PQR's own detection.
+- Metal-ligand distances are written as NAMD extraBonds restraints.
+- Disulfides are found by SG-SG distance and cross-checked against PDB2PQR's own detection.
 
 **7. Build.**
 
@@ -306,21 +307,21 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 
 ```
 <outdir>/
-├── summary.tsv                    one line per model
-├── cache/                         UniProt / AlphaFill downloads
-└── <model>/
-    ├── report.txt, report.json    what was done; REVIEW items first
-    ├── prepped.pdb                trimmed protein + kept cofactors (heavy atoms)
-    ├── dowser/                    Dowser++ logs and raw output
-    ├── pdb2pqr/                   PDB2PQR input, output, PROPKA log
-    └── build/
-        ├── build.tcl              psfgen script (rerun with: vmd -dispdev text < build.tcl)
-        ├── protein_<chain>.pdb, lig_NN_<code>.pdb, water_internal.pdb
-        ├── <model>.psf/.pdb       vacuum build
-        ├── <model>_ion.psf/.pdb   solvated and ionized system
-        ├── <model>_ion_box.txt    box dimensions (Å)
-        ├── metal_extrabonds.txt   NAMD extraBonds file (metal sites only)
-        └── vmd.log
+|-- summary.tsv                    one line per model
+|-- cache/                         UniProt / AlphaFill downloads
+`-- <model>/
+    |-- report.txt, report.json    what was done; REVIEW items first
+    |-- prepped.pdb                trimmed protein + kept cofactors (heavy atoms)
+    |-- dowser/                    Dowser++ logs and raw output
+    |-- pdb2pqr/                   PDB2PQR input, output, PROPKA log
+    `-- build/
+        |-- build.tcl              psfgen script (rerun with: vmd -dispdev text < build.tcl)
+        |-- protein_<chain>.pdb, lig_NN_<code>.pdb, water_internal.pdb
+        |-- <model>.psf/.pdb       vacuum build
+        |-- <model>_ion.psf/.pdb   solvated and ionized system
+        |-- <model>_ion_box.txt    box dimensions (Å)
+        |-- metal_extrabonds.txt   NAMD extraBonds file (metal sites only)
+        `-- vmd.log
 ```
 
 ### Common REVIEW flags
@@ -331,7 +332,7 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 | cofactor NOT built (no matching RESI) | add its topology (e.g. CGenFF via `toppar_prepare.py --extra-stream`) or an alias in `CCD_ALIASES` |
 | annotated cofactor not placed / cofactor binding site left empty | AlphaFill had no copy that fits the model's pocket (the reason is given); consider a homolog structure or co-folding |
 | UniProt suggests a state that isn't available | the cofactor was built from its PDB code; check its charge/redox state |
-| covalent cofactor/modification | needs a custom patch (e.g. PLP–Lys) |
+| covalent cofactor/modification | needs a custom patch (e.g. PLP-Lys) |
 | Dowser++ failed | see `dowser/*.log`; the model is built without internal waters |
 | psfgen reported errors | see `build/vmd.log` |
 
@@ -345,8 +346,8 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 | `--outdir` | `af_prep_out` | output folder |
 | `--toppar` | `./toppar` | output folder of `toppar_prepare.py` |
 | `--cache` | `<outdir>/cache` | UniProt/AlphaFill cache |
-| `--max-downloads` | 4 | parallel connections for UniProt/AlphaFill downloads, which are done before processing starts |
-| `--retries` | 6 | attempts per download; dropped connections, timeouts and HTTP 429/5xx are retried with backoff (2, 4, 8, … s) |
+| `--max-downloads` | 16 | parallel connections for UniProt/AlphaFill downloads, which are done before processing starts |
+| `--retries` | 6 | attempts per download; dropped connections, timeouts and HTTP 429/5xx are retried with backoff (2, 4, 8, ... s) |
 | `--accession` | | UniProt accession, for single-model runs without header information |
 | `--no-uniprot` | | skip UniProt; with the binding-site rule, no cofactors are kept |
 | `--name-map NAME=CODE` | | map a UniProt ligand name to a PDB code (repeatable) |
@@ -366,7 +367,7 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 | `--max-pocket-rmsd` | 1.5 Å | maximum pocket heavy-atom RMSD |
 | `--contact-dist` | 4 Å | contact distance for `--min-contact-frac` |
 | `--min-contact-frac` | 0.7 | minimum fraction of AlphaFill's contacts kept |
-| `--site-contact` | 4 Å | ligand–binding-site contact distance |
+| `--site-contact` | 4 Å | ligand-binding-site contact distance |
 | `--clash`, `--metal-clash`, `--max-clash` | 2.2 Å, 1.6 Å, 0 | clash distance and number of clashing atoms allowed |
 | `--burial-dist`, `--min-burial` | 4 Å, 0.5 | fraction of ligand atoms that must be buried |
 | `--min-site-coverage` | 0.5 | fraction of the annotated site residues the ligand must contact |
@@ -381,9 +382,9 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 | `--pdb2pqr` | `pdb2pqr` | executable |
 | `--pka-window` | 1.0 | report residues with pKa this close to the pH |
 | `--metal-cutoff` | 2.8 Å | metal-coordination distance |
-| `--metal-k` | 100 | extraBonds force constant (kcal/mol/Å²) |
+| `--metal-k` | 100 | extraBonds force constant (kcal/mol/Å^2) |
 | `--cys-deprot-patch` | `CYSD` | patch for metal-bound cysteines |
-| `--ss-cutoff`, `--ss-min` | 2.5 Å, 1.8 Å | SG–SG disulfide window |
+| `--ss-cutoff`, `--ss-min` | 2.5 Å, 1.8 Å | SG-SG disulfide window |
 
 **Dowser++**
 
@@ -414,7 +415,7 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 ## 5. Known limitations
 
 - **Single structures only.** Each model is a single AlphaFold prediction, and UniProt binding sites are applied to every chain (homomers).
-- **Some cofactors have no parameters.** Covalent cofactors, iron–sulfur clusters, heme c, PLP, TPP, coenzyme A, biotin and molybdopterin have no standard CHARMM36 topology in this setup.
+- **Some cofactors have no parameters.** Covalent cofactors, iron-sulfur clusters, heme c, PLP, TPP, coenzyme A, biotin and molybdopterin have no standard CHARMM36 topology in this setup.
   They are flagged rather than built.
 - **Charge and redox states come from annotation.** They are taken from UniProt names where available, otherwise from the PDB code of the transplanted ligand.
   Neither is a calculation.

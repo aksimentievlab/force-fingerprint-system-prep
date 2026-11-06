@@ -5,14 +5,13 @@ description = "Set up all-atom MD simulations for force fingerprinting"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "propka>=3",
     "ipdb>=0.13.13",
     "ipython>=8.18.1",
-    "rdkit>=2026.9.1",
     "pdb2pqr>=3.6.2",
     "gemmi>=0.7.5",
     "scipy>=1.13.1",
     "networkx>=3.2.1",
+    "tqdm>=4.70.1",
 ]
 
 [tool.uv]

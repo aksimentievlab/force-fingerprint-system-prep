@@ -10,6 +10,7 @@ dependencies:
   - gemmi
   - requests
   - r-base          # Dowser++ (water clustering step)
+  - tqdm
   - pip
   - pip:
       - pdb2pqr>=3.6.2   # also installs propka
