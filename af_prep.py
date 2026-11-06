@@ -688,6 +688,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
             continue
         coverage = {k: n / len(groups[k[1]]) for k, n in touched.items()}
         cands.append(dict(key=key, ccd=ccd, atoms=atoms, xyz=xyz, metal=metal,
+                          el=[a.element for a in la],
                           clashes=clashes, burial=burial, coverage=coverage, tag=tag,
                           donors=donors, cofactor=ccd in cofactor_ccds))
     if not_in_uniprot:
@@ -781,8 +782,30 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
         fit = fit_rmsd.get(c["key"])
         fit = f", {fit}" if fit else ""
         coord = f", {len(c['donors'])} protein donors" if c["metal"] else ""
-        rep.info(f"kept {c['tag']} at chain {site[0]}{label} (burial {c['burial']:.0%}, "
-                 f"site coverage {cov:.0%}, clashes {c['clashes']}{coord}{fit})")
+        c["kept_msg"] = (f"kept {c['tag']} at chain {site[0]}{label} (burial "
+                         f"{c['burial']:.0%}, site coverage {cov:.0%}, clashes "
+                         f"{c['clashes']}{coord}{fit})")
+
+    # Metal ions held by few protein atoms are usually completed by a substrate
+    # or nucleotide (e.g. Mg.ATP): keep them only if such a partner is kept too.
+    low_coord, dropped = {}, set()
+    for c in [k for k in kept if k["metal"] and len(k["donors"]) < cfg.min_metal_donors]:
+        partners = [k["tag"] for k in kept if not k["metal"] and any(
+            el in ("O", "N", "S") and np.linalg.norm(p - c["xyz"][0]) <= cfg.metal_coord
+            for el, p in zip(k["el"], k["xyz"]))]
+        n = len(c["donors"])
+        if partners:
+            c["kept_msg"] += f"; bridged by {', '.join(partners)}"
+            continue
+        kept.remove(c)
+        dropped.add(c["tag"])
+        filled.discard((c["ccd"],) + c["site"])
+        low_coord[(c["ccd"],) + c["site"]] = (
+            f"{c['tag']} dropped: only {n} protein donor(s) within {cfg.metal_coord} A "
+            "and no partner ligand kept (substrate-bridged ion, or a site completed "
+            "by waters?)")
+    for c in kept:
+        rep.info(c["kept_msg"])
 
     # annotated sites (per chain) that ended up without a ligand
     for ccd, groups in site_res.items():
@@ -793,7 +816,14 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
                 sk = (ccd, ch, label)
                 if sk in filled:
                     continue
+                lb = f" site {label}" if label else ""
+                if sk in low_coord:          # always worth a look, cofactor or not
+                    rep.review(f"{ccd} binding site{lb} in chain {ch} left empty "
+                               f"({low_coord[sk]})")
+                    continue
                 # site sharing residues with a filled one: one copy serves both
+                if covered.get(sk) in dropped:
+                    covered.pop(sk)
                 by = covered.get(sk) or next(
                     (k["tag"] for k in kept if k["ccd"] == ccd and k["site"][0] == ch
                      and overlapping(ccd, k["site"][1], label)), None)
@@ -1018,16 +1048,29 @@ def run_pdb2pqr(protein, waters, ligands, workdir, cfg, rep):
     inp = wd / "p2p_in.pdb"
     wat = [replace(w, record="HETATM", resname="HOH", name="O", chain="W", resnum=i)
            for i, w in enumerate(waters, 1)]
-    # own chain + numbering, so ligands can never be taken for protein residues
-    lig = [replace(a, record="HETATM", chain="L", resnum=k, icode="")
+    # Own chain + numbering, so ligands can never be taken for protein residues.
+    # Organic ligands get neutral residue names (LG1, LG2, ...): PDB2PQR would
+    # otherwise match some by name to its own templates, assign partial charges
+    # and abort on a non-integral total charge.  Metal ions keep their names,
+    # which is how PROPKA recognises them and their charge.
+    lig = [replace(a, record="HETATM", chain="L", resnum=k, icode="",
+                   resname=l["ccd"] if l["metal"] else f"LG{k}")
            for k, l in enumerate(ligands, 1) for a in heavy(l["atoms"])]
-    write_pdb(heavy(protein) + lig + wat, inp)
     out_pdb, out_pqr = wd / "p2p_out.pdb", wd / "p2p_out.pqr"
     cmd = [cfg.pdb2pqr, "--ff=CHARMM", "--ffout=CHARMM",
            "--titration-state-method=propka", f"--with-ph={cfg.ph}",
            "--keep-chain", f"--pdb-output={out_pdb}", str(inp), str(out_pqr)]
-    r = subprocess.run(cmd, cwd=wd, capture_output=True, text=True)
-    (wd / "pdb2pqr_stdout.log").write_text(r.stdout + r.stderr)
+    for attempt in ((lig, "with ligands"), ([], "without ligands")) if lig else (([], ""),):
+        write_pdb(heavy(protein) + attempt[0] + wat, inp)
+        out_pdb.unlink(missing_ok=True)
+        r = subprocess.run(cmd, cwd=wd, capture_output=True, text=True)
+        (wd / "pdb2pqr_stdout.log").write_text(r.stdout + r.stderr)
+        if r.returncode == 0 and out_pdb.exists():
+            break
+        if attempt[0]:
+            (wd / "pdb2pqr_with_ligands_failed.log").write_text(r.stdout + r.stderr)
+            rep.review("PDB2PQR failed with the ligands present; protonation computed "
+                       "without them (see pdb2pqr/pdb2pqr_with_ligands_failed.log)")
     if r.returncode != 0 or not out_pdb.exists():
         raise RuntimeError(f"pdb2pqr failed (see {wd}/pdb2pqr_stdout.log)")
     logtxt = ""
@@ -1630,7 +1673,7 @@ def process(model, cfg):
         if abs(pka - cfg.ph) < cfg.pka_window and (ch, rn) not in metal_bound:
             rep.info(f"{rname} {ch}{rn} pKa {pka:.2f} within {cfg.pka_window} of pH")
 
-    if ligands:
+    if ligands and not any("PDB2PQR failed with the ligands" in m for _, m in rep.flags):
         rep.info(f"PROPKA included {len(ligands)} ligand(s): organic ligands with "
                  "PROPKA's ligand model, metal ions as point charges")
 
@@ -1753,6 +1796,9 @@ def main(argv=None):
                    help="metal-donor distance for extraBonds restraints and overrides (A)")
     p.add_argument("--metal-coord", type=float, default=2.6,
                    help="protein N/O/S this close to a metal count as its donors (A)")
+    p.add_argument("--min-metal-donors", type=int, default=3,
+                   help="metal ions with fewer protein donors are kept only if a kept "
+                        "ligand bridges them (e.g. Mg.ATP); otherwise dropped and flagged")
     p.add_argument("--metal-min-sep", type=float, default=3.0,
                    help="minimum distance between two metal ions kept in sharing sites (A)")
     p.add_argument("--metal-k", type=float, default=100.0,

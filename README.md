@@ -255,6 +255,10 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
   for metal ions, at least 3 Å apart and each with protein donors (N/O/S within 2.6 Å) of its own, as in binuclear sites;
   organic ligands never share.
   A site served by a copy in a neighbouring site is reported as such, not as empty.
+- **Metal coordination.** A metal ion held by fewer than 3 protein donors (N/O/S within 2.6 Å) is usually completed by a substrate or nucleotide, as in Mg.ATP.
+  It is kept only if a kept ligand bridges it (an O/N/S of that ligand within 2.6 Å of the ion);
+  otherwise it is dropped and its site flagged REVIEW, whether or not UniProt calls it a cofactor:
+  the ion may be substrate-bridged, or its site may be completed by waters that AlphaFill does not transplant.
   The same tests apply to cofactors and to other annotated ligands (substrates, nucleotides);
   the only difference is the reporting: an annotated cofactor whose site stays empty is flagged REVIEW,
   any other ligand left out is noted as INFO.
@@ -288,6 +292,8 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 - PDB2PQR's coordinates are kept, including its Asn/Gln/His flips.
 - The kept cofactors and ligands are included:
   PROPKA accounts for organic ligands with its ligand model and treats metal ions as point charges.
+  Organic ligands are renamed `LG1`, `LG2`, ... for PDB2PQR, so that none is mistaken for one of its own templates;
+  should PDB2PQR still fail with the ligands present, it is rerun without them and the model is flagged.
 - Residues with pKa near the pH are reported.
 
 **6. Metal sites and disulfides.**
@@ -392,6 +398,7 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 | `--pka-window` | 1.0 | report residues with pKa this close to the pH |
 | `--metal-cutoff` | 2.8 Å | metal-donor distance for extraBonds restraints and residue overrides |
 | `--metal-coord` | 2.6 Å | protein N/O/S this close to a metal count as its donors |
+| `--min-metal-donors` | 3 | metal ions with fewer protein donors are kept only if a kept ligand bridges them |
 | `--metal-min-sep` | 3 Å | minimum distance between two metal ions in sites that share residues |
 | `--metal-k` | 100 | extraBonds force constant (kcal/mol/Å^2) |
 | `--cys-deprot-patch` | `CYSD` | patch for metal-bound cysteines |
