@@ -3,7 +3,9 @@
 af_prep.py - prepare AlphaFold models for CHARMM/NAMD simulation via psfgen.
 
 Pipeline, per model (order matters):
-  1. UniProt annotations: cofactors, binding sites, mature chain, covalent mods
+  1. UniProt annotations: cofactors, binding sites, mature chain, covalent mods;
+     ligand names mapped to PDB codes through their ChEBI IDs (ligand_resolver.py),
+     with LIGAND_NAME_TO_CCD and --name-map as overrides
   2. AlphaFill transplants, moved onto the input model by local superposition,
      filtered to annotated binding sites, best copy per site
   3. Terminal trimming by mature-chain boundaries and pLDDT (UniProt numbering kept)
@@ -17,7 +19,7 @@ Anything a human should look at is flagged REVIEW in <outdir>/<model>/report.txt
 and summarised in <outdir>/summary.tsv.
 
 Requirements: python>=3.8, numpy, scipy, networkx, gemmi, requests, pdb2pqr (CLI);
-tqdm (optional, progress bars).
+ligand_resolver.py in the same folder; tqdm (optional, progress bars).
 Optional: VMD (to run the generated build script); Dowser++ for internal waters.
 
 Example:
@@ -48,6 +50,10 @@ try:                                   # progress bars are optional
 except ImportError:                    # pragma: no cover
     tqdm = None
 
+## local import
+import ligand_resolver
+    
+    
 log = logging.getLogger("af_prep")
 
 # --------------------------------------------------------------------------
@@ -68,7 +74,18 @@ METAL_ELEMENTS = {"ZN", "MG", "CA", "MN", "FE", "CU", "NI", "CO", "CD", "NA",
 # codes.  Matching is case- and whitespace-insensitive.  Every ligand kept must
 # fit its pocket in the model (see select_ligands); whether a ligand is a cofactor
 # (named in a UniProt cofactor comment) only decides how a failure is reported.
-# Unmapped *cofactor* names are flagged REVIEW so you can extend this table.
+#
+# This table is an OVERRIDE: any other UniProt ligand is mapped automatically
+# from its ChEBI ID (ligand_resolver.py).  Keep entries here only where the
+# automatic mapping is not what you want, e.g.:
+#   - deliberate choices: accept either redox state ("NAD(+)": NAD and NAI),
+#     because AlphaFill may transplant either and the CHARMM state comes from
+#     uniprot_states.json anyway
+#   - ligands ChEBI has no structure for: iron-sulfur clusters, generic classes
+#     such as "a divalent metal cation"
+# <outdir>/ligand_table_audit.tsv compares every entry used in a run with the
+# automatic mapping; entries that agree can be removed.
+# Unmapped *cofactor* names are flagged REVIEW.
 LIGAND_NAME_TO_CCD = {
     # metal ions
     "Zn(2+)": ["ZN"], "Mg(2+)": ["MG"], "Ca(2+)": ["CA"], "Mn(2+)": ["MN"],
@@ -116,6 +133,9 @@ LIGAND_NAME_TO_CCD = {
 # cannot be mapped to one molecule.  Binding sites and cofactor comments with
 # these names are skipped (no REVIEW flags, nothing kept).  Extend with
 # --ignore-ligand; a name given with --name-map is never ignored.
+# Ligands whose ChEBI entry has no usable structure are recognised as generic
+# automatically; this list is still needed for names UniProt gives without a
+# ChEBI ID ("substrate", "product").
 IGNORED_LIGAND_NAMES = {
     "substrate", "product", "a protein", "DNA", "RNA", "tRNA", "mRNA", "rRNA",
     "chitin", "peptidoglycan", "a carbohydrate", "a beta-lactam", "an acyl-CoA",
@@ -127,6 +147,9 @@ IGNORED_LIGAND_NAMES = {
 # ligand (an ion in a sugar site, a buffer component in a substrate site, a
 # fragment of a larger ligand ...).  These are not suggested as name mappings.
 # Curate with <outdir>/ligand_name_suggestions.tsv, which lists all suggestions.
+# Only consulted for names that remain unmapped (no ChEBI ID, or no CCD match):
+# a transplant in the site of a ChEBI-mapped ligand is checked chemically
+# instead, so coincidences like an ion in a phosphate site are never suggested.
 NOT_A_MAPPING = {
     ("phosphate", "CA"), ("phosphate", "ABU"),
     ("acetate", "NA"),
@@ -334,6 +357,7 @@ def norm_name(s):
 
 
 NAME_TO_CCD_NORM = {norm_name(k): v for k, v in LIGAND_NAME_TO_CCD.items()}
+LIGAND_NAME_TO_CCD_ORIG = dict(NAME_TO_CCD_NORM)   # before --name-map changes it
 NOT_A_MAPPING_NORM = {(norm_name(n), c.upper()) for n, c in NOT_A_MAPPING}
 
 
@@ -423,18 +447,27 @@ def fetch_uniprot(acc, cache_dir):
 
 def parse_uniprot(d):
     info = {"cofactors": [], "sites": [], "modified": [], "chains": [],
+            "chebi": {},       # UniProt ligand name -> ChEBI ID
             "length": d.get("sequence", {}).get("length")}
     for cm in d.get("comments", []):
         if cm.get("commentType") == "COFACTOR":
             for c in cm.get("cofactors", []):
                 if c.get("name"):
                     info["cofactors"].append(c["name"])
+                    xref = c.get("cofactorCrossReference") or {}
+                    chebi = (ligand_resolver.normalize_chebi(xref.get("id"))
+                             if xref.get("database") == "ChEBI" else None)
+                    if chebi:
+                        info["chebi"].setdefault(c["name"], chebi)
     for f in d.get("features", []):
         loc = f.get("location", {})
         s = loc.get("start", {}).get("value")
         e = loc.get("end", {}).get("value")
         t = f.get("type")
         if t == "Binding site" and f.get("ligand"):
+            chebi = ligand_resolver.normalize_chebi(f["ligand"].get("id"))
+            if chebi and f["ligand"].get("name"):
+                info["chebi"].setdefault(f["ligand"]["name"], chebi)
             info["sites"].append({"ligand": f["ligand"].get("name"),
                                   "label": f["ligand"].get("label") or "",
                                   "start": s, "end": e})
@@ -446,10 +479,49 @@ def parse_uniprot(d):
     return info
 
 
-def allowed_ligands(uni, extra, ignore, rep):
-    """CCD codes to keep, binding-site residues per CCD code, and binding-site
-    residues of UniProt ligand names that have no CCD mapping.  Names in `ignore`
-    (normalised) are skipped."""
+CHEBI_CACHE_NAME = "chebi_ccd.json"     # in the --cache folder
+_RESOLUTIONS = {}
+
+
+def chebi_resolutions(cfg):
+    """ChEBI ID -> resolution (ligand_resolver.py), read once per process from
+    the cache file that resolve_chebi_ids() writes before models are processed."""
+    key = str(cfg.cache)
+    if key not in _RESOLUTIONS:
+        _RESOLUTIONS[key] = ligand_resolver.load_cache(Path(cfg.cache) / CHEBI_CACHE_NAME)
+    return _RESOLUTIONS[key]
+
+
+def ligand_codes(name, chebi_by_name, resolutions):
+    """PDB codes for a UniProt ligand name: (codes, how, resolution).
+    LIGAND_NAME_TO_CCD and --name-map take precedence; otherwise the codes come
+    from the ligand's ChEBI ID.  `how` says where the codes (or their absence)
+    come from; `resolution` is the ligand_resolver result, if any."""
+    codes = NAME_TO_CCD_NORM.get(norm_name(name))
+    chebi = chebi_by_name.get(name)
+    res = resolutions.get(chebi) if chebi else None
+    if codes:
+        return list(codes), "table", res
+    if not chebi:
+        return [], "no ChEBI ID in UniProt", None
+    if res is None:
+        return [], f"{chebi} not resolved (ChEBI/RCSB lookup failed; rerun to retry)", None
+    if res["codes"]:
+        methods = sorted({res["methods"][c] for c in res["codes"]},
+                         key=ligand_resolver.METHOD_PRIORITY.get)
+        return list(res["codes"]), f"{chebi} via {', '.join(methods)}", res
+    if res["status"] == "generic":
+        return [], f"{chebi} has no structure in ChEBI (generic class or cluster)", res
+    return [], f"no CCD entry matches {chebi}", res
+
+
+def allowed_ligands(uni, extra, ignore, resolutions, rep):
+    """CCD codes to keep, binding-site residues per CCD code, binding-site
+    residues of UniProt ligand names that have no CCD mapping, and related
+    codes per mapped site (stereo-ambiguous matches and analogs, for
+    reporting).  Names in `ignore` (normalised) are skipped; names whose ChEBI
+    entry has no structure are treated as generic and skipped too, except
+    cofactors, which are flagged REVIEW."""
     allowed = set(extra)
     expected = set()
     ignored = sorted({n for n in uni["cofactors"] + [x["ligand"] for x in uni["sites"]]
@@ -458,31 +530,67 @@ def allowed_ligands(uni, extra, ignore, rep):
         rep.info(f"ignored UniProt ligand names: {', '.join(ignored)}")
     uni = dict(uni, cofactors=[n for n in uni["cofactors"] if norm_name(n) not in ignore],
                sites=[x for x in uni["sites"] if norm_name(x["ligand"]) not in ignore])
+    chebi_by_name = uni.get("chebi", {})
+    mapping = {}
+
+    def codes_for(name):
+        if name not in mapping:
+            mapping[name] = ligand_codes(name, chebi_by_name, resolutions)
+        return mapping[name][0]
+
+    def is_generic(name):
+        codes, _, res = mapping[name]
+        return not codes and res is not None and res["status"] == "generic"
+
     for name in uni["cofactors"]:
-        ccds = NAME_TO_CCD_NORM.get(norm_name(name))
+        ccds = codes_for(name)
         if ccds:
             allowed |= set(ccds)
             expected.add(tuple(ccds))
         else:
-            rep.review(f"UniProt cofactor '{name}' has no CCD mapping; extend "
-                       "LIGAND_NAME_TO_CCD")
+            rep.review(f"UniProt cofactor '{name}' has no CCD mapping "
+                       f"({mapping[name][1]}); add it to LIGAND_NAME_TO_CCD or use "
+                       f"--name-map \"{name}=CODE\"")
     # site_res[ccd][label] = residue numbers. UniProt labels distinguish several
     # copies of the same ligand ("1", "2"); unlabelled features form one site.
-    site_res, unmapped, site_names = {}, {}, {}
+    site_res, unmapped, site_names, related = {}, {}, {}, []
+    generic = set()
     for s in uni["sites"]:
-        ccds = NAME_TO_CCD_NORM.get(norm_name(s["ligand"]))
+        ccds = codes_for(s["ligand"])
+        residues = set(range(s["start"], s["end"] + 1))
+        res = mapping[s["ligand"]][2]
+        if res and mapping[s["ligand"]][1] != "table":
+            # codes that match only loosely: reported if AlphaFill puts them here
+            kinds = {c: "stereo_ambiguous" for c in res.get("stereo_ambiguous", [])}
+            for c in res.get("similar", []):
+                kinds.setdefault(c, "similar")
+            kinds = {c: k for c, k in kinds.items() if c not in ccds}
+            if kinds:
+                related.append((s["ligand"], residues, kinds, ccds))
         if not ccds:
-            unmapped.setdefault(s["ligand"], set()).update(range(s["start"], s["end"] + 1))
+            if is_generic(s["ligand"]):
+                generic.add(s["ligand"])
+            else:
+                unmapped.setdefault(s["ligand"], set()).update(residues)
             continue
         allowed |= set(ccds)
         for c in ccds:
             site_res.setdefault(c, {}).setdefault(s.get("label", ""), set()).update(
-                range(s["start"], s["end"] + 1))
+                residues)
             site_names.setdefault(c, {}).setdefault(s.get("label", ""), set()).add(s["ligand"])
     for name in uni["cofactors"]:                 # fallback when a site gives no state
-        for c in NAME_TO_CCD_NORM.get(norm_name(name), []):
+        for c in codes_for(name):
             site_names.setdefault(c, {}).setdefault("*cofactor*", set()).add(name)
-    return allowed, expected, site_res, unmapped, site_names
+    if generic:
+        rep.info("UniProt ligands without a defined structure (generic classes), "
+                 f"skipped: {', '.join(sorted(generic))}")
+    lines = [f"{n} -> {'/'.join(c)} ({how})" for n, (c, how, _) in sorted(mapping.items())
+             if c]
+    if lines:
+        rep.info("UniProt ligands mapped to PDB codes: " + "; ".join(lines))
+    rep.data["ligand_mapping"] = {n: {"chebi": chebi_by_name.get(n), "codes": c, "via": how}
+                                  for n, (c, how, _) in sorted(mapping.items())}
+    return allowed, expected, site_res, unmapped, site_names, related
 
 
 # --------------------------------------------------------------------------
@@ -641,7 +749,7 @@ def transplant_ligands(ligs, af_protein, protein, cfg, rep):
     return out, metrics
 
 
-def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
+def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_rmsd,
                    cofactor_ccds, cfg, rep):
     """Keep ligands that sit in a UniProt-annotated binding site for that ligand
     and fit the model's pocket (no clashes, buried, covering the site), at most
@@ -655,6 +763,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
         chain_res.setdefault(a.chain, set()).add(a.resnum)
     cands, no_sites = [], set()
     not_in_uniprot, unmapped_hits = Counter(), {}
+    related_hits = Counter()      # (name, code, kind): loose matches in mapped sites
     for key, atoms in ligands.items():
         ccd = key[3]
         tag = f"{ccd} {key[0]}{key[1]}"
@@ -666,11 +775,16 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
                     for i in lst}
             hits = [n for n, res in unmapped.items() if near & res
                     and (norm_name(n), ccd) not in NOT_A_MAPPING_NORM]
-            if hits:
-                for n in hits:
-                    unmapped_hits.setdefault((n, ccd), 0)
-                    unmapped_hits[(n, ccd)] += 1
-            else:
+            # a ChEBI-mapped site holding a code that matches only loosely
+            # (stereo left undefined in the CCD entry, or an analog)
+            rel = [(n, kinds[ccd], codes) for n, res, kinds, codes in related
+                   if ccd in kinds and near & res]
+            for n in hits:
+                unmapped_hits.setdefault((n, ccd), 0)
+                unmapped_hits[(n, ccd)] += 1
+            for n, kind, codes in rel:
+                related_hits[(n, ccd, kind, tuple(codes))] += 1
+            if not hits and not rel:
                 not_in_uniprot[ccd] += 1
             continue
         groups = site_res.get(ccd)
@@ -714,6 +828,18 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
         rep.review(f"{n} AlphaFill {ccd} copy(ies) sit in the UniProt binding site for "
                    f"'{name}', which has no CCD mapping - to keep them, run with "
                    f"--name-map \"{name}={ccd}\" (or add it to LIGAND_NAME_TO_CCD)")
+    rep.data["related_ligands"] = [[name, ccd, kind, n] for (name, ccd, kind, _), n
+                                   in sorted(related_hits.items())]
+    for (name, ccd, kind, codes), n in sorted(related_hits.items()):
+        fix = f"--name-map \"{name}={','.join(codes + (ccd,))}\""
+        if kind == "stereo_ambiguous":
+            rep.review(f"{n} AlphaFill {ccd} copy(ies) sit in the binding site for "
+                       f"'{name}' and match it only when stereochemistry is ignored "
+                       f"(the CCD entry may leave it undefined); not kept - to keep "
+                       f"them, run with {fix}")
+        else:
+            rep.info(f"{n} AlphaFill {ccd} copy(ies) in the binding site for '{name}' "
+                     f"are a related compound (analog), not kept; {fix} would keep them")
     for ccd in sorted(no_sites):
         (rep.review if ccd in cofactor_ccds else rep.info)(
             f"{ccd} is annotated in UniProt but without binding-site residues; no copy "
@@ -1639,6 +1765,49 @@ def prefetch(cfg):
         log.warning("%d downloads failed after retries, e.g. %s", len(failed), failed[0])
 
 
+def run_ligand_names(cfg):
+    """{(UniProt ligand name, ChEBI ID)} over all models of this run whose
+    UniProt entry is in the cache."""
+    pairs = set()
+    for m in cfg.models:
+        try:
+            acc, _, _ = model_accession(Path(m), cfg)
+        except Exception:  # noqa: BLE001 - reported again in process()
+            continue
+        f = Path(cfg.cache) / f"{acc}.json" if acc else None
+        if f and f.exists():
+            try:
+                pairs |= set(parse_uniprot(json.loads(f.read_text()))["chebi"].items())
+            except (ValueError, KeyError, TypeError):
+                continue
+    return pairs
+
+
+def resolve_chebi_ids(cfg):
+    """Resolve every ChEBI ID of this run once, in the main process, into
+    <cache>/chebi_ccd.json; the model workers only read that file.  Results
+    already in the file are reused; failed lookups are retried next run."""
+    if cfg.no_uniprot:
+        return
+    ids = sorted({c for _, c in run_ligand_names(cfg)})
+    if not ids:
+        return
+    path = Path(cfg.cache) / CHEBI_CACHE_NAME
+    todo = len(set(ids) - set(ligand_resolver.load_cache(path)))
+    if todo and tqdm is None:
+        log.warning("resolving %d ChEBI IDs to PDB codes", todo)
+    progress = ((lambda it, total: tqdm(it, total=total, desc="ChEBI", unit="id"))
+                if tqdm else None)
+    results = ligand_resolver.resolve_many(ids, path, workers=min(cfg.max_downloads, 4),
+                                           progress=progress)
+    failed = sorted(c for c, r in results.items() if not r["complete"])
+    if failed:
+        log.warning("%d ChEBI ID(s) could not be fully resolved and will be retried "
+                    "next run, e.g. %s: %s", len(failed), failed[0],
+                    "; ".join(results[failed[0]]["notes"][:2]))
+    _RESOLUTIONS.pop(str(cfg.cache), None)        # reread in this process
+
+
 def process(model, cfg):
     model = Path(model)
     name = re.sub(r"[^A-Za-z0-9_.-]", "_", model.stem)
@@ -1646,8 +1815,8 @@ def process(model, cfg):
     outdir.mkdir(parents=True, exist_ok=True)
     rep = Report(name)
     cfg._transfer_drops = False
-    for nm, ccd in cfg.name_map.items():          # user-supplied UniProt name -> CCD
-        NAME_TO_CCD_NORM[norm_name(nm)] = [ccd]
+    for nm, ccds in cfg.name_map.items():         # user-supplied UniProt name -> CCD
+        NAME_TO_CCD_NORM[norm_name(nm)] = list(ccds)
     acc, af_id, notes = model_accession(model, cfg)
     for n in notes:
         rep.review(n)
@@ -1674,9 +1843,10 @@ def process(model, cfg):
                            f"{m['desc']} - needs a custom patch")
             elif m["type"] == "Glycosylation":
                 rep.info(f"glycosylation at {m['pos']}: {m['desc']} (not modelled)")
-    allowed, expected, site_res, unmapped, site_names = (
-        allowed_ligands(uni, cfg.keep_ligands, cfg.ignore_names, rep) if uni
-        else (set(cfg.keep_ligands), set(), {}, {}, {}))
+    allowed, expected, site_res, unmapped, site_names, related = (
+        allowed_ligands(uni, cfg.keep_ligands, cfg.ignore_names,
+                        chebi_resolutions(cfg), rep) if uni
+        else (set(cfg.keep_ligands), set(), {}, {}, {}, []))
 
     # --- 2. AlphaFill
     af_file = get_alphafill(acc, af_id, cfg.alphafill, cfg.alphafill_url, cfg.cache, rep)
@@ -1712,8 +1882,8 @@ def process(model, cfg):
                                           else a.resname) for a in protein}
 
     cofactor_ccds = {c for ccds in expected for c in ccds}
-    ligands = (select_ligands(protein, ligs, allowed, site_res, unmapped, fit_rmsd,
-                              cofactor_ccds, cfg, rep) if ligs else [])
+    ligands = (select_ligands(protein, ligs, allowed, site_res, unmapped, related,
+                              fit_rmsd, cofactor_ccds, cfg, rep) if ligs else [])
     for lig in ligands:                           # UniProt names of the site each one fills
         names = site_names.get(lig["ccd"], {})
         lig["uniprot"] = sorted(names.get(lig["site_label"], set())
@@ -1861,6 +2031,50 @@ def write_name_suggestions(cfg):
         fh.write("uniprot_name\tccd\tcopies\tn_models\tmodels\n")
         for (uni_name, ccd), (n, models) in sorted(agg.items(), key=lambda x: -x[1][0]):
             fh.write(f"{uni_name}\t{ccd}\t{n}\t{len(models)}\t{','.join(models)}\n")
+    # loose matches (stereo-ambiguous, analogs) found in ChEBI-mapped sites
+    rel = defaultdict(lambda: [0, []])
+    for m in cfg.models:
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(m).stem)
+        f = Path(cfg.outdir) / name / "report.json"
+        if f.exists():
+            for uni_name, ccd, kind, n in json.loads(f.read_text()).get("related_ligands", []):
+                rel[(uni_name, ccd, kind)][0] += n
+                rel[(uni_name, ccd, kind)][1].append(name)
+    with open(Path(cfg.outdir) / "related_ligands.tsv", "w") as fh:
+        fh.write("uniprot_name\tccd\tkind\tcopies\tn_models\tmodels\n")
+        for (uni_name, ccd, kind), (n, models) in sorted(rel.items(), key=lambda x: -x[1][0]):
+            fh.write(f"{uni_name}\t{ccd}\t{kind}\t{n}\t{len(models)}\t{','.join(models)}\n")
+    write_table_audit(cfg)
+
+
+def write_table_audit(cfg):
+    """<outdir>/ligand_table_audit.tsv: for every UniProt ligand name of this run
+    that LIGAND_NAME_TO_CCD or --name-map covers, the table's codes next to the
+    ChEBI-based ones.  Rows that agree can be removed from the table; the
+    others are deliberate choices or table errors.  Disagreements come first."""
+    resolutions = ligand_resolver.load_cache(Path(cfg.cache) / CHEBI_CACHE_NAME)
+    overrides = {norm_name(k): (v, "name-map") for k, v in cfg.name_map.items()}
+    rows = []
+    for uni_name, chebi in sorted(run_ligand_names(cfg)):
+        table, source = overrides.get(norm_name(uni_name)) or (
+            LIGAND_NAME_TO_CCD_ORIG.get(norm_name(uni_name)), "table")
+        if not table:
+            continue
+        r = resolutions.get(chebi)
+        auto = r["codes"] if r else []
+        status = r["status"] if r else "not resolved"
+        only_t = sorted(set(table) - set(auto))
+        only_a = sorted(set(auto) - set(table))
+        verdict = ("same" if r and not only_t and not only_a
+                   else "no ChEBI structure" if r and r["status"] == "generic"
+                   else "unresolved" if not r else "differs")
+        rows.append((verdict != "same", verdict, uni_name, chebi, source, ",".join(table),
+                     ",".join(auto), ",".join(only_t), ",".join(only_a), status))
+    with open(Path(cfg.outdir) / "ligand_table_audit.tsv", "w") as fh:
+        fh.write("verdict\tuniprot_name\tchebi\tsource\ttable_codes\tchebi_codes\t"
+                 "only_in_table\tonly_from_chebi\tchebi_status\n")
+        for row in sorted(rows, key=lambda r: (not r[0], r[1], r[2].lower())):
+            fh.write("\t".join(row[1:]) + "\n")
 
 
 def _run_one(m, cfg):
@@ -1905,9 +2119,10 @@ def main(argv=None):
                    help="ligand-protein contact distance for --min-contact-frac (A)")
     p.add_argument("--min-contact-frac", type=float, default=0.7,
                    help="drop ligands keeping less than this fraction of AlphaFill's contacts")
-    p.add_argument("--name-map", action="append", default=[], metavar="NAME=CCD",
-                   help="map a UniProt ligand name to a CCD code, e.g. \"ATP=ATP\" "
-                        "(repeatable)")
+    p.add_argument("--name-map", action="append", default=[], metavar="NAME=CCD[,CCD]",
+                   help="map a UniProt ligand name to one or more CCD codes, replacing "
+                        "the automatic (ChEBI-based) mapping, e.g. "
+                        "\"(S)-lactate=2OP,LAC\" (repeatable)")
     p.add_argument("--ignore-ligand", action="append", default=[], metavar="NAME",
                    help="UniProt ligand name to ignore, in addition to IGNORED_LIGAND_NAMES "
                         "(repeatable)")
@@ -1986,10 +2201,13 @@ def main(argv=None):
     cfg = p.parse_args(argv)
     cfg.keep_ligands = {s.strip().upper() for s in cfg.keep_ligands.split(",") if s.strip()}
     try:
-        cfg.name_map = dict((k.strip(), v.strip().upper()) for k, v in
-                            (m.rsplit("=", 1) for m in cfg.name_map))
+        cfg.name_map = dict((k.strip(), [c.strip().upper() for c in v.split(",")
+                                         if c.strip()])
+                            for k, v in (m.rsplit("=", 1) for m in cfg.name_map))
     except ValueError:
-        sys.exit("--name-map expects NAME=CCD")
+        sys.exit("--name-map expects NAME=CCD or NAME=CCD,CCD")
+    if any(not codes for codes in cfg.name_map.values()):
+        sys.exit("--name-map expects at least one CCD code after '='")
     # names given explicitly with --name-map are never ignored
     cfg.ignore_names = ({norm_name(n) for n in IGNORED_LIGAND_NAMES | set(cfg.ignore_ligand)}
                         - {norm_name(n) for n in cfg.name_map})
@@ -2019,6 +2237,7 @@ def main(argv=None):
     from contextlib import nullcontext
     with (logging_redirect_tqdm() if tqdm else nullcontext()):  # log lines above the bars
         prefetch(cfg)
+        resolve_chebi_ids(cfg)
         rows_by = {}
         if cfg.jobs > 1:
             # models are independent; each Dowser++ run uses its own copy of the
