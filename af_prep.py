@@ -650,6 +650,9 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
     ph = heavy(protein)
     tree = cKDTree(coords(ph))
     chains = sorted({a.chain for a in ph})
+    chain_res = {}
+    for a in ph:
+        chain_res.setdefault(a.chain, set()).add(a.resnum)
     cands, no_sites = [], set()
     not_in_uniprot, unmapped_hits = Counter(), {}
     for key, atoms in ligands.items():
@@ -824,6 +827,8 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
             continue  # nothing of this type was transplanted; reported elsewhere
         for label in groups:
             for ch in chains:
+                if not groups[label] & chain_res.get(ch, set()):
+                    continue                  # site not in this chain/segment
                 sk = (ccd, ch, label)
                 if sk in filled:
                     continue
@@ -859,52 +864,143 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
 # 3. Trimming
 # --------------------------------------------------------------------------
 
+def mature_spans(residues, chains, cfg):
+    """Decide which UniProt mature chains of one model chain to build.
+    residues: [(key, atoms)] of the model chain; chains: [(start, end)] from UniProt.
+    Returns (spans to keep, message, is_problem)."""
+    chains = sorted(chains)
+    if len(chains) == 1:
+        return chains, "", False
+    if any(chains[i][1] >= chains[i + 1][0] for i in range(len(chains) - 1)):
+        best = max(chains, key=lambda c: c[1] - c[0])
+        return [best], (f"UniProt lists overlapping mature chains {chains} (alternative "
+                        f"forms); kept the longest, {best[0]}-{best[1]}"), False
+    # Links between mature chains: a disulfide, or a large interface - the latter
+    # only for chains long enough that a contact means more than a peptide lying
+    # on the precursor's surface.
+    atoms_of = [[a for key, at in residues if s <= key[1] <= e for a in heavy(at)]
+                for s, e in chains]
+    present = [i for i, at in enumerate(atoms_of) if at]
+    if not present:
+        return None, f"none of the UniProt mature chains {chains} is in the model", True
+    nres = {i: len({a.resnum for a in atoms_of[i]}) for i in present}
+    links = {}
+    for i in present:
+        for j in present:
+            if j <= i:
+                continue
+            sg_i = [a for a in atoms_of[i] if a.name == "SG"]
+            sg_j = [a for a in atoms_of[j] if a.name == "SG"]
+            if any(np.linalg.norm(np.subtract(p.xyz, q.xyz)) < cfg.ss_cutoff
+                   for p in sg_i for q in sg_j):
+                links[(i, j)] = "disulfide"
+                continue
+            small, big = (i, j) if nres[i] <= nres[j] else (j, i)
+            if nres[small] < cfg.min_chain_interface_len:
+                continue
+            ts, tb = cKDTree(coords(atoms_of[small])), cKDTree(coords(atoms_of[big]))
+            touching = {atoms_of[small][k].resnum for k, lst in
+                        enumerate(ts.query_ball_tree(tb, 4.5)) if lst}
+            frac = len(touching) / nres[small]
+            if frac >= cfg.chain_interface_frac:
+                links[(i, j)] = f"interface {frac:.0%}"
+
+    def component(start):
+        comp, todo = {start}, [start]
+        while todo:
+            i = todo.pop()
+            for (a, b) in links:
+                for x, y in ((a, b), (b, a)):
+                    if x == i and y not in comp:
+                        comp.add(y)
+                        todo.append(y)
+        return comp
+
+    main = max(present, key=lambda i: nres[i])
+    comp = component(main)
+    rng = lambda i: f"{chains[i][0]}-{chains[i][1]}"
+    how = "; ".join(f"{rng(a)}/{rng(b)}: {w}" for (a, b), w in links.items()
+                    if a in comp and b in comp)
+    kept = [chains[i] for i in sorted(comp)]
+    dropped = [chains[i] for i in present if i not in comp]
+    n_kept = sum(nres[i] for i in comp)
+    if not dropped:
+        if len(kept) == 1:
+            return kept, "", False
+        return kept, (f"mature protein of {len(kept)} chains held together ({how}); "
+                      "built as separate segments, excised linkers removed"), False
+    if n_kept >= cfg.main_chain_frac * sum(nres.values()):
+        msg = f"kept mature chain(s) {kept}" + (f" ({how})" if how else "")
+        return kept, (msg + f"; unlinked short chains {dropped} removed"
+                      + ("; built as separate segments" if len(kept) > 1 else "")), False
+    return None, (f"UniProt lists {len(chains)} mature chains {chains} that are not all "
+                  "linked by disulfides or large interfaces in the model (polyprotein?); "
+                  "mature boundaries not applied - choose the product to simulate"), True
+
+
+_SEG_IDS = "ABCDEFGHIJKMNOPQRSTUVYZ0123456789abcdefghijklmnopqrstuvwxyz"  # no L/W/X
+
+
 def trim_protein(protein, plddt, uni, cfg, rep):
-    """Returns trimmed atoms and {chain: (first_patch, last_patch)}."""
+    """Trim each model chain to its mature span(s) and confident termini.
+    Mature chains that are built separately get their own chain IDs (one psfgen
+    segment each).  Returns trimmed atoms and {chain: (first, last, n0, n1)}."""
     out, termini = [], {}
     by_chain = OrderedDict()
     for key, atoms in group_residues(protein).items():
         by_chain.setdefault(key[0], []).append((key, atoms))
-    span = None
-    if uni and len(uni["chains"]) == 1:
-        span = uni["chains"][0]
-    elif uni and len(uni["chains"]) > 1:
-        rep.review(f"UniProt lists {len(uni['chains'])} mature chains "
-                   "(polyprotein?); mature boundaries not applied")
+    free_ids = [c for c in _SEG_IDS if c not in by_chain]
+    uni_chains = uni["chains"] if uni else []
+    spans_info = {}
     for ch, residues in by_chain.items():
         nums = [k[1] for k, _ in residues]
-        lo, hi = (span if span else (nums[0], nums[-1]))
-        idx = [i for i, n in enumerate(nums) if lo <= n <= hi]
-        if not idx:
-            rep.review(f"chain {ch}: no residues inside mature span {lo}-{hi}")
-            idx = list(range(len(nums)))
-        conf = [plddt.get((ch, nums[i]), 100.0) >= cfg.plddt for i in idx]
-        w = cfg.trim_window
-        first = next((j for j in range(len(idx)) if all(conf[j:j + w])), 0)
-        last = next((j for j in range(len(idx) - 1, -1, -1)
-                     if all(conf[max(0, j - w + 1):j + 1])), len(idx) - 1)
-        keep = idx[first:last + 1]
-        n0, n1 = nums[keep[0]], nums[keep[-1]]
-        n_native, c_native = n0 == lo, n1 == hi
-        if span and lo > nums[0]:
-            rep.info(f"chain {ch}: removed {lo - nums[0]} residues before mature "
-                     f"chain (signal/transit/propeptide/iMet)")
-        if not n_native:
-            rep.info(f"chain {ch}: N-terminus trimmed to {n0} by pLDDT -> ACE cap")
-        if not c_native:
-            rep.info(f"chain {ch}: C-terminus trimmed to {n1} by pLDDT -> CT3 cap")
-        low = [nums[i] for i in keep if plddt.get((ch, nums[i]), 100) < cfg.plddt]
-        if low:
-            rep.info(f"chain {ch}: {len(low)} internal residues below pLDDT "
-                     f"{cfg.plddt} kept")
-        first_res = residues[keep[0]][0][3]
-        if n_native:
-            fp = {"PRO": "PROP", "GLY": "GLYP"}.get(first_res, "NTER")
+        spans, msg, problem = (mature_spans(residues, uni_chains, cfg) if uni_chains
+                               else (None, "", False))
+        if msg:
+            (rep.review if problem else rep.info)(f"chain {ch}: {msg}")
+        if not spans:
+            spans = [(nums[0], nums[-1])]
+            mature = False
         else:
-            fp = "ACP" if first_res == "PRO" else "ACE"
-        termini[ch] = (fp, "CTER" if c_native else "CT3", n0, n1)
-        for i in keep:
-            out.extend(residues[i][1])
+            mature = True
+        if mature and spans[0][0] > nums[0]:
+            rep.info(f"chain {ch}: removed {spans[0][0] - nums[0]} residues before the "
+                     "mature chain (signal/transit/propeptide/iMet)")
+        for n_span, (lo, hi) in enumerate(spans):
+            seg_ch = ch if n_span == 0 else free_ids.pop(0)
+            idx = [i for i, n in enumerate(nums) if lo <= n <= hi]
+            if not idx:
+                rep.review(f"chain {ch}: no residues inside mature span {lo}-{hi}")
+                continue
+            conf = [plddt.get((ch, nums[i]), 100.0) >= cfg.plddt for i in idx]
+            w = cfg.trim_window
+            first = next((j for j in range(len(idx)) if all(conf[j:j + w])), 0)
+            last = next((j for j in range(len(idx) - 1, -1, -1)
+                         if all(conf[max(0, j - w + 1):j + 1])), len(idx) - 1)
+            keep = idx[first:last + 1]
+            n0, n1 = nums[keep[0]], nums[keep[-1]]
+            n_native, c_native = n0 == lo, n1 == hi
+            tag = f"chain {seg_ch}" + (f" (residues {lo}-{hi} of chain {ch})"
+                                       if len(spans) > 1 else "")
+            if not n_native:
+                rep.info(f"{tag}: N-terminus trimmed to {n0} by pLDDT -> ACE cap")
+            if not c_native:
+                rep.info(f"{tag}: C-terminus trimmed to {n1} by pLDDT -> CT3 cap")
+            low = [nums[i] for i in keep if plddt.get((ch, nums[i]), 100) < cfg.plddt]
+            if low:
+                rep.info(f"{tag}: {len(low)} internal residues below pLDDT "
+                         f"{cfg.plddt} kept")
+            first_res = residues[keep[0]][0][3]
+            if n_native:
+                fp = {"PRO": "PROP", "GLY": "GLYP"}.get(first_res, "NTER")
+            else:
+                fp = "ACP" if first_res == "PRO" else "ACE"
+            termini[seg_ch] = (fp, "CTER" if c_native else "CT3", n0, n1)
+            spans_info[seg_ch] = (ch, n0, n1)
+            for i in keep:
+                out.extend(replace(a, chain=seg_ch) for a in residues[i][1])
+    rep.data["segments"] = {k: f"chain {v[0]} residues {v[1]}-{v[2]}"
+                            for k, v in spans_info.items()}
     return out, termini
 
 
@@ -1089,6 +1185,16 @@ def run_pdb2pqr(protein, waters, ligands, workdir, cfg, rep):
         if f.exists():
             logtxt += f.read_text()
     atoms = read_pdb(out_pdb)
+    # PDB2PQR splits chains at backbone breaks and may relabel the pieces; it
+    # keeps the residue order, so map its protein residues back to ours by order
+    in_keys = list(dict.fromkeys((a.chain, a.resnum) for a in heavy(protein)))
+    out_keys = list(dict.fromkeys((a.chain, a.resnum) for a in atoms
+                                  if not is_water(a) and a.chain not in ("L", "W")))
+    if out_keys != in_keys and len(out_keys) == len(in_keys) and \
+            all(o[1] == i[1] for o, i in zip(out_keys, in_keys)):
+        remap = dict(zip(out_keys, in_keys))
+        atoms = [replace(a, chain=remap[(a.chain, a.resnum)][0])
+                 if (a.chain, a.resnum) in remap else a for a in atoms]
     # CHARMM output renames disulfide residues DISU with atoms "1CB"/"1SG";
     # restore plain heavy-atom names, remember which residues PDB2PQR bonded.
     p2p_disu = {(a.chain, a.resnum) for a in atoms
@@ -1808,6 +1914,14 @@ def main(argv=None):
     p.add_argument("--keep-ligands", default="",
                    help="extra CCD codes to keep, comma-separated (e.g. ATP,ADP)")
     p.add_argument("--plddt", type=float, default=50.0, help="terminal trim threshold")
+    p.add_argument("--main-chain-frac", type=float, default=0.8,
+                   help="with several UniProt mature chains, keep only the longest if it "
+                        "holds this fraction of their residues")
+    p.add_argument("--min-chain-interface-len", type=int, default=30,
+                   help="shorter mature chains count as linked only through a disulfide")
+    p.add_argument("--chain-interface-frac", type=float, default=0.5,
+                   help="mature chains count as one protein if linked by a disulfide or if "
+                        "this fraction of the smaller chain's residues touch the other")
     p.add_argument("--trim-window", type=int, default=3)
     p.add_argument("--clash", type=float, default=2.2)
     p.add_argument("--metal-clash", type=float, default=1.6)

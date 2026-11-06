@@ -280,6 +280,17 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 
 **3. Trimming.**
 - Residues outside UniProt's mature chain are removed: signal peptide, propeptides, initiator Met.
+- When UniProt lists several mature chains, the chains are first tested for links in the model:
+  a disulfide, or an interface covering at least 50% of the smaller chain's residues
+  (interfaces only count for chains of at least 30 residues; a short peptide may just lie on the precursor's surface).
+  - Overlapping chains are alternative forms; the longest is kept.
+  - The longest chain and all chains linked to it are kept.
+  Each becomes its own segment with its own termini, and excised linkers are removed,
+  as for chymotrypsin-like proteases or insulin.
+  - Unlinked chains are dropped if what is kept holds at least 80% of the mature residues.
+  - Otherwise the protein is likely a polyprotein of independent products:
+  no mature boundaries are applied and the model is flagged REVIEW, so you can choose the product to simulate.
+  - `report.json` lists the segments under `segments`.
 - Disordered termini are trimmed by pLDDT (`--plddt`, `--trim-window`).
 - Residue numbering stays UniProt numbering.
 - Native termini get NTER/CTER (PROP/GLYP for an N-terminal Pro/Gly).
@@ -402,6 +413,9 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 | Option | Default | Meaning |
 |---|---|---|
 | `--plddt`, `--trim-window` | 50, 3 | terminal trimming threshold and window |
+| `--main-chain-frac` | 0.8 | fraction of the mature residues the kept chains must hold before unlinked chains are dropped |
+| `--chain-interface-frac` | 0.5 | mature chains count as linked if this fraction of the smaller chain's residues touch the other |
+| `--min-chain-interface-len` | 30 | shorter mature chains count as linked only through a disulfide |
 | `--ph` | 7.0 | pH for PDB2PQR/PROPKA |
 | `--pdb2pqr` | `pdb2pqr` | executable |
 | `--pka-window` | 1.0 | report residues with pKa this close to the pH |
