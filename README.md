@@ -244,12 +244,17 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
     symmetric Asp/Glu/Phe/Tyr/Arg atoms are handled);
   - your model keeps >= 70% of the ligand-protein contacts AlphaFill had.
 - **Selecting what to keep.** A ligand is kept only if it touches a binding-site residue that UniProt annotates for that ligand, and it fits your model's pocket:
-  - no ligand heavy atom closer than 2.2 Å to a protein heavy atom (1.6 Å for metal ions);
+  - at most 3 ligand heavy atoms closer than 2.2 Å to a protein heavy atom;
+  metal atoms, also inside clusters and hemes, only count below 1.6 Å, since they bond to protein N/O/S at 2.0-2.4 Å;
   - at least 50% of its heavy atoms buried (a protein heavy atom within 4 Å);
   - contact with at least 50% of the residues UniProt annotates for the site.
 
   An apo-like pocket, collapsed or opened up, fails these tests.
   At most one copy is kept per annotated site and chain.
+  Sites of the same ligand that share residues get a second copy only if both can coexist:
+  for metal ions, at least 3 Å apart and each with protein donors (N/O/S within 2.6 Å) of its own, as in binuclear sites;
+  organic ligands never share.
+  A site served by a copy in a neighbouring site is reported as such, not as empty.
   The same tests apply to cofactors and to other annotated ligands (substrates, nucleotides);
   the only difference is the reporting: an annotated cofactor whose site stays empty is flagged REVIEW,
   any other ligand left out is noted as INFO.
@@ -258,7 +263,10 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
   (`IGNORED_LIGAND_NAMES` in `af_prep.py`, extended with `--ignore-ligand`);
   a name given with `--name-map` is never ignored.
   - Transplants UniProt doesn't mention (crystallization additives and the like) are summarized in one line.
-  - A transplant in an annotated site whose UniProt name has no code mapping is flagged REVIEW, with the `--name-map` fix spelled out.
+  - A transplant in an annotated site whose UniProt name has no code mapping is flagged REVIEW, with the `--name-map` fix spelled out,
+  unless the pair is a known coincidence listed in `NOT_A_MAPPING` (an ion in a sugar site and the like).
+  All such suggestions of a run are collected in `<outdir>/ligand_name_suggestions.tsv`;
+  add the coincidental ones to `NOT_A_MAPPING` and the genuine ones to `LIGAND_NAME_TO_CCD`.
 
 **3. Trimming.**
 - Residues outside UniProt's mature chain are removed: signal peptide, propeptides, initiator Met.
@@ -308,6 +316,7 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 ```
 <outdir>/
 |-- summary.tsv                    one line per model
+|-- ligand_name_suggestions.tsv    unmapped UniProt names with the codes found in their sites
 |-- cache/                         UniProt / AlphaFill downloads
 `-- <model>/
     |-- report.txt, report.json    what was done; REVIEW items first
@@ -368,7 +377,7 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 | `--contact-dist` | 4 Å | contact distance for `--min-contact-frac` |
 | `--min-contact-frac` | 0.7 | minimum fraction of AlphaFill's contacts kept |
 | `--site-contact` | 4 Å | ligand-binding-site contact distance |
-| `--clash`, `--metal-clash`, `--max-clash` | 2.2 Å, 1.6 Å, 0 | clash distance and number of clashing atoms allowed |
+| `--clash`, `--metal-clash`, `--max-clash` | 2.2 Å, 1.6 Å, 3 | clash distance and number of clashing atoms allowed |
 | `--burial-dist`, `--min-burial` | 4 Å, 0.5 | fraction of ligand atoms that must be buried |
 | `--min-site-coverage` | 0.5 | fraction of the annotated site residues the ligand must contact |
 | `--overlap` | 2 Å | ligand copies closer than this occupy the same site |
@@ -381,7 +390,9 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 | `--ph` | 7.0 | pH for PDB2PQR/PROPKA |
 | `--pdb2pqr` | `pdb2pqr` | executable |
 | `--pka-window` | 1.0 | report residues with pKa this close to the pH |
-| `--metal-cutoff` | 2.8 Å | metal-coordination distance |
+| `--metal-cutoff` | 2.8 Å | metal-donor distance for extraBonds restraints and residue overrides |
+| `--metal-coord` | 2.6 Å | protein N/O/S this close to a metal count as its donors |
+| `--metal-min-sep` | 3 Å | minimum distance between two metal ions in sites that share residues |
 | `--metal-k` | 100 | extraBonds force constant (kcal/mol/Å^2) |
 | `--cys-deprot-patch` | `CYSD` | patch for metal-bound cysteines |
 | `--ss-cutoff`, `--ss-min` | 2.5 Å, 1.8 Å | SG-SG disulfide window |

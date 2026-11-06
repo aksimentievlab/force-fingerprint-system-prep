@@ -122,6 +122,29 @@ IGNORED_LIGAND_NAMES = {
     "an L-alpha-amino acid", "a 2'-deoxyribonucleoside 5'-triphosphate", "pyridine",
 }
 
+# (UniProt ligand name, PDB code) pairs that are known coincidences: the
+# transplanted molecule happens to sit in a site annotated for a different
+# ligand (an ion in a sugar site, a buffer component in a substrate site, a
+# fragment of a larger ligand ...).  These are not suggested as name mappings.
+# Curate with <outdir>/ligand_name_suggestions.tsv, which lists all suggestions.
+NOT_A_MAPPING = {
+    ("phosphate", "CA"), ("phosphate", "ABU"),
+    ("acetate", "NA"),
+    ("L-cysteine", "NA"), ("L-cysteine", "MG"), ("L-cysteine", "AMP"),
+    ("L-glutamate", "AMP"), ("L-glutamine", "NO3"),
+    ("beta-D-glucose", "MG"), ("beta-D-galactose", "NO3"),
+    ("alpha-D-glucose 1,6-bisphosphate", "CO"), ("alpha-D-glucose 1,6-bisphosphate", "CA"),
+    ("adenosine 3',5'-bisphosphate", "CA"),
+    ("a 1,2-diacyl-sn-glycero-3-phospho-(1D-myo-inositol-4,5-bisphosphate)", "MG"),
+    ("a 1,2-diacyl-sn-glycero-3-phospho-(1D-myo-inositol-4,5-bisphosphate)", "CA"),
+    ("UDP-N-acetyl-alpha-D-muramoyl-L-alanine", "NO3"),
+    ("UDP-N-acetyl-alpha-D-muramoyl-L-alanine", "CA"),
+    ("oxalate", "ADP"), ("1D-myo-inositol 1,3,4-trisphosphate", "ADP"),
+    ("1D-myo-inositol hexakisphosphate", "ATP"),
+    ("ADP-alpha-D-glucose", "COA"), ("4-coumaroyl-CoA", "COA"),
+    ("N(7)-methyl-GMP", "CTN"), ("N(7)-methyl-GMP", "U5P"),
+}
+
 # PDB-code -> CHARMM aliases and UniProt state -> CHARMM residue come from the
 # toppar folder (ccd_aliases.json, uniprot_states.json, written by
 # toppar_prepare.py), so they always match the topologies psfgen will load.
@@ -300,6 +323,7 @@ def norm_name(s):
 
 
 NAME_TO_CCD_NORM = {norm_name(k): v for k, v in LIGAND_NAME_TO_CCD.items()}
+NOT_A_MAPPING_NORM = {(norm_name(n), c.upper()) for n, c in NOT_A_MAPPING}
 
 
 def accession_from_name(path):
@@ -626,7 +650,8 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
             xyz = coords(heavy(atoms) or atoms)
             near = {ph[i].resnum for lst in tree.query_ball_point(xyz, cfg.site_contact)
                     for i in lst}
-            hits = [n for n, res in unmapped.items() if near & res]
+            hits = [n for n, res in unmapped.items() if near & res
+                    and (norm_name(n), ccd) not in NOT_A_MAPPING_NORM]
             if hits:
                 for n in hits:
                     unmapped_hits.setdefault((n, ccd), 0)
@@ -642,7 +667,13 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
         xyz = coords(la)
         d, _ = tree.query(xyz)
         metal = len(la) == 1 and la[0].element in METAL_ELEMENTS
-        clashes = int(np.sum(d < (cfg.metal_clash if metal else cfg.clash)))
+        # metal atoms (also inside clusters and hemes) bond to protein N/O/S at
+        # ~2.0-2.4 A, so they only clash below --metal-clash
+        thr = np.array([cfg.metal_clash if a.element in METAL_ELEMENTS else cfg.clash
+                        for a in la])
+        clashes = int(np.sum(d < thr))
+        donors = ({i for i in tree.query_ball_point(xyz[0], cfg.metal_coord)
+                   if ph[i].element in ("N", "O", "S")} if metal else set())
         burial = float(np.mean(d <= cfg.burial_dist))
         near = {(ph[i].chain, ph[i].resnum)
                 for lst in tree.query_ball_point(xyz, cfg.site_contact) for i in lst}
@@ -658,10 +689,12 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
         coverage = {k: n / len(groups[k[1]]) for k, n in touched.items()}
         cands.append(dict(key=key, ccd=ccd, atoms=atoms, xyz=xyz, metal=metal,
                           clashes=clashes, burial=burial, coverage=coverage, tag=tag,
-                          cofactor=ccd in cofactor_ccds))
+                          donors=donors, cofactor=ccd in cofactor_ccds))
     if not_in_uniprot:
         rep.info("dropped AlphaFill ligands not mentioned in UniProt: " +
                  ", ".join(f"{c} x{n}" for c, n in not_in_uniprot.most_common()))
+    rep.data["name_suggestions"] = [[name, ccd, n] for (name, ccd), n
+                                    in sorted(unmapped_hits.items())]
     for (name, ccd), n in sorted(unmapped_hits.items()):
         rep.review(f"{n} AlphaFill {ccd} copy(ies) sit in the UniProt binding site for "
                    f"'{name}', which has no CCD mapping - to keep them, run with "
@@ -686,13 +719,36 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
     # best-fitting copies first
     cands.sort(key=lambda c: (bool(failures(c, max(c["coverage"].values()))),
                               -max(c["coverage"].values()), c["clashes"]))
-    kept, filled, best_reject = [], set(), {}
+    # annotated sites of the same ligand that share residues: alternative or
+    # adjacent positions; a second copy is only allowed where both can coexist
+    def overlapping(ccd, l1, l2):
+        g = site_res[ccd]
+        return l1 != l2 and bool(g[l1] & g[l2])
+
+    def coexists(c, k):
+        """Can copy c sit next to kept copy k of the same ligand?"""
+        if c["metal"] and k["metal"]:
+            sep = float(np.linalg.norm(c["xyz"][0] - k["xyz"][0]))
+            own = c["donors"] - k["donors"]
+            if sep < cfg.metal_min_sep:
+                return False, f"{sep:.1f} A from {k['tag']}"
+            if len(c["donors"]) < 2 or not own:
+                return False, (f"no protein coordination of its own next to {k['tag']} "
+                               f"({len(c['donors'])} donors, {len(own)} not shared)")
+            return True, ""
+        return False, f"site overlaps the one filled by {k['tag']}"
+
+    kept, filled, best_reject, covered = [], set(), {}, {}
     for c in cands:
         open_sites = [k for k in c["coverage"] if (c["ccd"],) + k not in filled]
         if not open_sites:
             rep.info(f"dropped {c['tag']} (site already has a better-placed copy)")
             continue
-        site = max(open_sites, key=lambda k: c["coverage"][k])
+        # best coverage; among equals, the site fewest other copies could fill
+        # (so e.g. two ions of a binuclear site each get their own site)
+        later = cands[cands.index(c) + 1:]
+        site = max(open_sites, key=lambda k: (
+            c["coverage"][k], -sum(k in o["coverage"] for o in later if o["ccd"] == c["ccd"])))
         cov = c["coverage"][site]
         fail = failures(c, cov)
         if fail:
@@ -705,14 +761,28 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
                < cfg.overlap for k in kept):
             rep.info(f"dropped {c['tag']} (overlaps a kept ligand)")
             continue
+        # same ligand already placed in an overlapping site of this chain?
+        clash_with = [k for k in kept if k["ccd"] == c["ccd"] and k["site"][0] == site[0]
+                      and overlapping(c["ccd"], k["site"][1], site[1])]
+        if c["metal"]:   # metal ions too close to coexist, whatever the labels
+            clash_with += [k for k in kept if k["metal"] and k not in clash_with and
+                           np.linalg.norm(c["xyz"][0] - k["xyz"][0]) < cfg.metal_min_sep]
+        verdicts = [coexists(c, k) for k in clash_with]
+        if any(not ok for ok, _ in verdicts):
+            why = next(w for ok, w in verdicts if not ok)
+            covered.setdefault((c["ccd"],) + site, clash_with[0]["tag"])
+            rep.info(f"dropped {c['tag']} ({why})")
+            continue
         filled.add((c["ccd"],) + site)
+        c["site"] = site
         c["site_label"] = site[1]
         kept.append(c)
         label = f" site {site[1]}" if site[1] else ""
         fit = fit_rmsd.get(c["key"])
         fit = f", {fit}" if fit else ""
+        coord = f", {len(c['donors'])} protein donors" if c["metal"] else ""
         rep.info(f"kept {c['tag']} at chain {site[0]}{label} (burial {c['burial']:.0%}, "
-                 f"site coverage {cov:.0%}, clashes {c['clashes']}{fit})")
+                 f"site coverage {cov:.0%}, clashes {c['clashes']}{coord}{fit})")
 
     # annotated sites (per chain) that ended up without a ligand
     for ccd, groups in site_res.items():
@@ -722,6 +792,15 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, fit_rmsd,
             for ch in chains:
                 sk = (ccd, ch, label)
                 if sk in filled:
+                    continue
+                # site sharing residues with a filled one: one copy serves both
+                by = covered.get(sk) or next(
+                    (k["tag"] for k in kept if k["ccd"] == ccd and k["site"][0] == ch
+                     and overlapping(ccd, k["site"][1], label)), None)
+                if by:
+                    lb = f" site {label}" if label else ""
+                    rep.info(f"{ccd} binding site{lb} in chain {ch} shares residues with "
+                             f"a site filled by {by}; one copy placed")
                     continue
                 why = (f"best copy did not fit: {best_reject[sk]}"
                        if sk in best_reject else "no transplanted copy touches it"
@@ -1582,6 +1661,26 @@ def process(model, cfg):
     return rep
 
 
+def write_name_suggestions(cfg):
+    """Collect the unmapped-name suggestions of all models of this run into
+    <outdir>/ligand_name_suggestions.tsv, most frequent first."""
+    from collections import defaultdict
+    agg = defaultdict(lambda: [0, []])
+    for m in cfg.models:
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(m).stem)
+        f = Path(cfg.outdir) / name / "report.json"
+        if not f.exists():
+            continue
+        for uni_name, ccd, n in json.loads(f.read_text()).get("name_suggestions", []):
+            agg[(uni_name, ccd)][0] += n
+            agg[(uni_name, ccd)][1].append(name)
+    out = Path(cfg.outdir) / "ligand_name_suggestions.tsv"
+    with open(out, "w") as fh:
+        fh.write("uniprot_name\tccd\tcopies\tn_models\tmodels\n")
+        for (uni_name, ccd), (n, models) in sorted(agg.items(), key=lambda x: -x[1][0]):
+            fh.write(f"{uni_name}\t{ccd}\t{n}\t{len(models)}\t{','.join(models)}\n")
+
+
 def _run_one(m, cfg):
     try:
         rep = process(m, cfg)
@@ -1636,7 +1735,7 @@ def main(argv=None):
     p.add_argument("--trim-window", type=int, default=3)
     p.add_argument("--clash", type=float, default=2.2)
     p.add_argument("--metal-clash", type=float, default=1.6)
-    p.add_argument("--max-clash", type=int, default=0,
+    p.add_argument("--max-clash", type=int, default=3,
                    help="ligand heavy atoms allowed closer than --clash to the protein")
     p.add_argument("--burial-dist", type=float, default=4.0,
                    help="a ligand atom is buried if a protein heavy atom is this close (A)")
@@ -1650,7 +1749,12 @@ def main(argv=None):
                    help="ligand copies closer than this are the same site")
     p.add_argument("--pdb2pqr", default="pdb2pqr")
     p.add_argument("--pka-window", type=float, default=1.0)
-    p.add_argument("--metal-cutoff", type=float, default=2.8)
+    p.add_argument("--metal-cutoff", type=float, default=2.8,
+                   help="metal-donor distance for extraBonds restraints and overrides (A)")
+    p.add_argument("--metal-coord", type=float, default=2.6,
+                   help="protein N/O/S this close to a metal count as its donors (A)")
+    p.add_argument("--metal-min-sep", type=float, default=3.0,
+                   help="minimum distance between two metal ions kept in sharing sites (A)")
     p.add_argument("--metal-k", type=float, default=100.0,
                    help="extraBonds force constant, kcal/mol/A^2")
     p.add_argument("--cys-deprot-patch", default="CYSD",
@@ -1735,6 +1839,7 @@ def main(argv=None):
             for m in bar(cfg.models, len(cfg.models), "models"):
                 rows_by[m] = _run_one(m, cfg)
     rows = [rows_by[m] for m in cfg.models]
+    write_name_suggestions(cfg)
     with open(Path(cfg.outdir) / "summary.tsv", "w") as fh:
         fh.write("model\tstatus\tn_review\n")
         for r in rows:
