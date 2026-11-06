@@ -128,7 +128,13 @@ python af_prep.py filtered_dataset/filtered_mf/structures/SOME_PROTEIN.pdb \
 
 ### 2.3 Checking the results
 
-- **`1-prep/summary.tsv`** has one line per model: `OK`, `REVIEW` (with the number of flags) or `ERROR`.
+- **`1-prep/summary.tsv`** has one line per model:
+  its status, the number of REVIEW and NEEDS_PARAMS items, and the ligands that need parameters.
+  The status is the most serious category present: `ERROR`, `REVIEW`, `NEEDS_PARAMS` or `OK`.
+  REVIEW means something about the structure needs a decision;
+  NEEDS_PARAMS means only that kept ligands could not be built for lack of CHARMM parameters.
+- **`1-prep/needs_params.tsv`** lists those ligands over the whole run, most frequent first,
+  so you can decide which are worth parameterizing.
 - **`1-prep/<model>/report.txt`** lists, for each model, what was done and what needs attention.
   REVIEW items come first.
 - **The built system** is in `1-prep/<model>/build/`.
@@ -321,11 +327,12 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 
 ```
 <outdir>/
-|-- summary.tsv                    one line per model
+|-- summary.tsv                    one line per model: status, counts, ligands needing parameters
+|-- needs_params.tsv               ligands not built for lack of parameters, over all models
 |-- ligand_name_suggestions.tsv    unmapped UniProt names with the codes found in their sites
 |-- cache/                         UniProt / AlphaFill downloads
 `-- <model>/
-    |-- report.txt, report.json    what was done; REVIEW items first
+    |-- report.txt, report.json    what was done: REVIEW, then NEEDS_PARAMS, then INFO
     |-- prepped.pdb                trimmed protein + kept cofactors (heavy atoms)
     |-- dowser/                    Dowser++ logs and raw output
     |-- pdb2pqr/                   PDB2PQR input, output, PROPKA log
@@ -339,12 +346,14 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
         `-- vmd.log
 ```
 
-### Common REVIEW flags
+### Common REVIEW and NEEDS_PARAMS items
 
 | Flag | What to do |
 |---|---|
 | AlphaFill ligand sits in a UniProt site with no code mapping | add `--name-map "NAME=CODE"` if you want it |
-| cofactor NOT built (no matching RESI) | add its topology (e.g. CGenFF via `toppar_prepare.py --extra-stream`) or an alias in `CCD_ALIASES` |
+| NEEDS_PARAMS: ligand NOT built (no matching RESI) | add its topology (e.g. CGenFF via `toppar_prepare.py --extra-stream`) or an alias in `CCD_ALIASES` |
+| NEEDS_PARAMS: cluster NOT built (bonded model needed) | add published parameters for the cluster and its bonds to the protein |
+| REVIEW: ligand NOT built (heavy-atom graph does not match) | the transplanted copy is likely incomplete or distorted; check `build/lig_*.pdb` |
 | annotated cofactor not placed / cofactor binding site left empty | AlphaFill had no copy that fits the model's pocket (the reason is given); consider a homolog structure or co-folding |
 | UniProt suggests a state that isn't available | the cofactor was built from its PDB code; check its charge/redox state |
 | covalent cofactor/modification | needs a custom patch (e.g. PLP-Lys) |

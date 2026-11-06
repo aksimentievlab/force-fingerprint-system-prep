@@ -288,15 +288,26 @@ class Report:
         log.warning("[%s] REVIEW: %s", self.name, msg)
         self.flags.append(("REVIEW", msg))
 
+    def needs_params(self, code, msg):
+        """A kept ligand that could not be built for lack of CHARMM parameters."""
+        log.warning("[%s] NEEDS_PARAMS: %s", self.name, msg)
+        self.flags.append(("NEEDS_PARAMS", msg))
+        self.data.setdefault("needs_params", []).append(code)
+
     def info(self, msg):
         log.info("[%s] %s", self.name, msg)
         self.flags.append(("INFO", msg))
 
+    def count(self, level):
+        return sum(1 for l, _ in self.flags if l == level)
+
     @property
     def status(self):
-        if any(l == "ERROR" for l, _ in self.flags):
-            return "ERROR"
-        return "REVIEW" if any(l == "REVIEW" for l, _ in self.flags) else "OK"
+        """ERROR > REVIEW > NEEDS_PARAMS > OK"""
+        for level in ("ERROR", "REVIEW", "NEEDS_PARAMS"):
+            if self.count(level):
+                return level
+        return "OK"
 
     def write(self, outdir):
         outdir = Path(outdir)
@@ -305,7 +316,7 @@ class Report:
              "flags": [{"level": l, "msg": m} for l, m in self.flags],
              **self.data}, indent=2, default=str))
         lines = [f"Model: {self.name}", f"Status: {self.status}", ""]
-        for lvl in ("ERROR", "REVIEW", "INFO"):
+        for lvl in ("ERROR", "REVIEW", "NEEDS_PARAMS", "INFO"):
             items = [m for l, m in self.flags if l == lvl]
             if items:
                 lines.append(f"{lvl}:")
@@ -1389,9 +1400,18 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
                 rep.info(msg + (f"; {note}" if note else ""))
         else:
             write_pdb(heavy(lig["atoms"]), f, sid)
-            rep.review(f"{ccd} NOT built ({why}) - written to build/{f.name}; add its "
-                       "topology to the toppar (e.g. toppar_prepare.py --extra-stream with "
-                       "CGenFF output) or an alias to CCD_ALIASES in toppar_prepare.py")
+            if ccd in NEEDS_BONDED:
+                hint = ("needs a bonded model to its protein ligands, e.g. published "
+                        "cluster parameters added with toppar_prepare.py --extra-stream")
+            else:
+                hint = ("add its topology to the toppar (e.g. toppar_prepare.py "
+                        "--extra-stream with CGenFF output) or an alias to CCD_ALIASES "
+                        "in toppar_prepare.py")
+            msg = f"{ccd} NOT built ({why}) - written to build/{f.name}; {hint}"
+            if ccd in NEEDS_BONDED or why.startswith("no matching RESI"):
+                rep.needs_params(ccd, msg)       # parameterisation work
+            else:
+                rep.review(msg)                  # e.g. incomplete or distorted copy
             tcl += [f"# NEEDS_PARAMS: {ccd} in {f.name} (segment {sid}) not built"]
 
     for his, lig in phem:
@@ -1705,8 +1725,9 @@ def process(model, cfg):
 
 
 def write_name_suggestions(cfg):
-    """Collect the unmapped-name suggestions of all models of this run into
-    <outdir>/ligand_name_suggestions.tsv, most frequent first."""
+    """Collect, over all models of this run, the unmapped-name suggestions into
+    <outdir>/ligand_name_suggestions.tsv and the ligands that could not be built
+    for lack of parameters into <outdir>/needs_params.tsv, most frequent first."""
     from collections import defaultdict
     agg = defaultdict(lambda: [0, []])
     for m in cfg.models:
@@ -1717,6 +1738,18 @@ def write_name_suggestions(cfg):
         for uni_name, ccd, n in json.loads(f.read_text()).get("name_suggestions", []):
             agg[(uni_name, ccd)][0] += n
             agg[(uni_name, ccd)][1].append(name)
+    params = defaultdict(list)
+    for m in cfg.models:
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(m).stem)
+        f = Path(cfg.outdir) / name / "report.json"
+        if f.exists():
+            for code in json.loads(f.read_text()).get("needs_params", []):
+                params[code].append(name)
+    with open(Path(cfg.outdir) / "needs_params.tsv", "w") as fh:
+        fh.write("ccd\tcopies\tn_models\tmodels\n")
+        for code, models in sorted(params.items(), key=lambda x: -len(x[1])):
+            fh.write(f"{code}\t{len(models)}\t{len(set(models))}\t"
+                     f"{','.join(sorted(set(models)))}\n")
     out = Path(cfg.outdir) / "ligand_name_suggestions.tsv"
     with open(out, "w") as fh:
         fh.write("uniprot_name\tccd\tcopies\tn_models\tmodels\n")
@@ -1727,11 +1760,11 @@ def write_name_suggestions(cfg):
 def _run_one(m, cfg):
     try:
         rep = process(m, cfg)
-        n_rev = sum(1 for l, _ in rep.flags if l == "REVIEW")
-        return (Path(m).name, rep.status, n_rev)
+        return (Path(m).name, rep.status, rep.count("REVIEW"), rep.count("NEEDS_PARAMS"),
+                ",".join(sorted(set(rep.data.get("needs_params", [])))))
     except Exception as exc:  # noqa: BLE001
         log.error("[%s] ERROR: %s", m, exc)
-        return (Path(m).name, f"ERROR: {exc}", "-")
+        return (Path(m).name, f"ERROR: {exc}", "-", "-", "")
 
 
 def main(argv=None):
@@ -1887,7 +1920,7 @@ def main(argv=None):
     rows = [rows_by[m] for m in cfg.models]
     write_name_suggestions(cfg)
     with open(Path(cfg.outdir) / "summary.tsv", "w") as fh:
-        fh.write("model\tstatus\tn_review\n")
+        fh.write("model\tstatus\tn_review\tn_needs_params\tneeds_params\n")
         for r in rows:
             fh.write("\t".join(map(str, r)) + "\n")
     for r in rows:
