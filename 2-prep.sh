@@ -5,12 +5,18 @@
 eval "$(micromamba shell hook --shell bash)"
 micromamba activate dpfunc
 
+# REVIEW=$(awk '$2 ~ /REVIEW/ {print $1}' 2-prep.log |
+# 	     sed 's:\(.*\):filtered_dataset/filtered_mf/structures/\1:')
+
+# uvr af_prep.py filtered_dataset/filtered_mf/structures/{ACYP_ECOLI,ISCX_ECOLI,TFF3_HUMAN}.pdb \
+# uvr af_prep.py $REVIEW \
+
 uvr af_prep.py filtered_dataset/filtered_mf/structures/*.pdb \
     --outdir 2-prep \
     --ph 7.0 \
     --alphafill auto \
     --toppar ./toppar \
-    --solvate --padding 16 --salt 0.15 \
+    --solvate --padding 12 --salt 0.15 \
     --dowser-dir $(pwd)/extern/dowserplusplus \
     --dowser-path "$(dirname $(micromamba run -n dpfunc which R))" \
     --run-vmd \
