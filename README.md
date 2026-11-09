@@ -1,10 +1,11 @@
 # AlphaFold -> CHARMM/NAMD system preparation
 
-Two scripts turn AlphaFold models into simulation-ready CHARMM36 systems for NAMD:
+Two scripts, with one helper module, turn AlphaFold models into simulation-ready CHARMM36 systems for NAMD:
 
 - **`toppar_prepare.py`** builds a clean, psfgen-ready copy of the CHARMM36 force field in `./toppar`.
 - **`af_prep.py`** prepares each AlphaFold model in turn:
   - adds cofactors (AlphaFill transplants, checked against UniProt annotations) and internal waters (Dowser++);
+  UniProt ligands are mapped to PDB codes through their ChEBI IDs by **`ligand_resolver.py`**, which must sit next to `af_prep.py`;
   - assigns protonation states (PDB2PQR/PROPKA), metal sites and disulfides;
   - builds a solvated, ionized PSF/PDB with VMD/psfgen.
 
@@ -65,6 +66,10 @@ Activate this environment before running either script.
 Dowser++ finds R on the `PATH`, which the active environment provides.
 
 Optional extra: `parmed`, used only by `toppar_prepare.py --verify`.
+
+`af_prep.py` needs network access the first time it sees a protein or ligand:
+UniProt and AlphaFill for each model, and, for the ligand mapping, ChEBI, PubChem and the RCSB search and data APIs.
+Everything is cached in `<outdir>/cache`, so reruns work offline.
 
 ### 1.3 External programs
 
@@ -241,6 +246,16 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 - the mature chain boundaries;
 - modified residues: covalent cofactors and glycosylation are flagged.
 
+Each ligand UniProt names in a cofactor comment or binding site comes with a ChEBI ID.
+`ligand_resolver.py` maps these IDs to PDB (CCD) codes, once per run and before any model is processed,
+and stores the results in `<outdir>/cache/chebi_ccd.json` (section 5).
+`LIGAND_NAME_TO_CCD` in `af_prep.py` and `--name-map` override the automatic mapping;
+`<outdir>/ligand_table_audit.tsv` compares every table entry used in a run with the automatic result, so entries that agree can be removed.
+Ligands without a structure in ChEBI (generic classes such as "a divalent metal cation", or clusters such as [2Fe-2S]) are skipped,
+unless the table maps them;
+an unmapped cofactor is flagged REVIEW.
+Each report lists the mapping it used and how each code was found.
+
 **2. Cofactors and other ligands from AlphaFill.**
 
 - **Moving ligands onto your model.** Transplanted ligands are moved onto *your* model by superposing the C-alpha atoms within 10 Å of each ligand.
@@ -258,22 +273,38 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
   An apo-like pocket, collapsed or opened up, fails these tests.
   At most one copy is kept per annotated site and chain.
   Sites of the same ligand that share residues get a second copy only if both can coexist:
-  for metal ions, at least 3 Å apart and each with protein donors (N/O/S within 2.6 Å) of its own, as in binuclear sites;
+  for metal ions, at least 3 Å apart and each with protein donors of its own, as in binuclear sites;
   organic ligands never share.
   A site served by a copy in a neighbouring site is reported as such, not as empty.
-- **Metal coordination.** A metal ion held by fewer than 3 protein donors (N/O/S within 2.6 Å) is usually completed by a substrate or nucleotide, as in Mg.ATP.
-  It is kept only if a kept ligand bridges it (an O/N/S of that ligand within 2.6 Å of the ion);
+- **Metal coordination.** A transplanted metal ion sits where it was in the homolog's crystal structure, while the side chains of your model may be a few tenths of an Å off.
+  Each ion is therefore first moved, by at most 1 Å, to where its potential donors sit at typical bond lengths, without approaching other atoms;
+  the move is kept only if it does not lose donors, and the report gives its size.
+  Donors are protein atoms that can coordinate a metal (side-chain O and S, histidine N, backbone O)
+  within the metal's typical bond length plus 0.35 Å,
+  e.g. about 2.1 Å for Zn-N/O, 2.3 Å for Zn-S, 2.4 Å for Ca-O and 2.8 Å for K-O.
+  The same distances define the extraBonds restraints.
+  A metal ion held by fewer than 3 protein donors is usually completed by a substrate or nucleotide, as in Mg.ATP.
+  It is kept only if a kept ligand bridges it (an O/N/S of that ligand within bonding distance of the ion);
   otherwise it is dropped and its site flagged REVIEW, whether or not UniProt calls it a cofactor:
   the ion may be substrate-bridged, or its site may be completed by waters that AlphaFill does not transplant.
   The same tests apply to cofactors and to other annotated ligands (substrates, nucleotides);
   the only difference is the reporting: an annotated cofactor whose site stays empty is flagged REVIEW,
   any other ligand left out is noted as INFO.
+- **Cofactors without annotated residues.** UniProt sometimes names a cofactor without binding-site positions.
+  Copies of such a cofactor are kept if they pass the clash and burial tests and, for metal ions, have at least 3 protein donors.
+  The number of copies is taken from UniProt's cofactor note ("Binds 2 Mg(2+) ions per subunit"), otherwise one per chain.
 - **Reporting.**
+  - When a cofactor's missing site is already explained by a site-level line (site left empty, ion dropped, no copy fitting),
+  the summary line "annotated cofactor ... not placed" is noted as INFO instead of repeating the REVIEW.
   - Generic UniProt ligand names such as "substrate", "a protein" or "DNA" are ignored
   (`IGNORED_LIGAND_NAMES` in `af_prep.py`, extended with `--ignore-ligand`);
   a name given with `--name-map` is never ignored.
   - Transplants UniProt doesn't mention (crystallization additives and the like) are summarized in one line.
-  - A transplant in an annotated site whose UniProt name has no code mapping is flagged REVIEW, with the `--name-map` fix spelled out,
+  - A transplant in the site of a ChEBI-mapped ligand that matches it only when stereochemistry is ignored
+  (the CCD entry may leave stereo undefined) is not kept and is flagged REVIEW, with the `--name-map` fix spelled out.
+  A transplant that is a related compound (an analog, such as ANP in an ATP site) is not kept and is noted as INFO.
+  Both are collected in `<outdir>/related_ligands.tsv`.
+  - A transplant in the site of a ligand that remains unmapped (no ChEBI ID, or no CCD entry matches it) is flagged REVIEW, with the `--name-map` fix spelled out,
   unless the pair is a known coincidence listed in `NOT_A_MAPPING` (an ion in a sugar site and the like).
   All such suggestions of a run are collected in `<outdir>/ligand_name_suggestions.tsv`;
   add the coincidental ones to `NOT_A_MAPPING` and the genuine ones to `LIGAND_NAME_TO_CCD`.
@@ -341,7 +372,9 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 |-- summary.tsv                    one line per model: status, counts, ligands needing parameters
 |-- needs_params.tsv               ligands not built for lack of parameters, over all models
 |-- ligand_name_suggestions.tsv    unmapped UniProt names with the codes found in their sites
-|-- cache/                         UniProt / AlphaFill downloads
+|-- related_ligands.tsv            stereo-ambiguous matches and analogs found in mapped sites
+|-- ligand_table_audit.tsv         LIGAND_NAME_TO_CCD / --name-map entries vs. the ChEBI-based mapping
+|-- cache/                         UniProt / AlphaFill downloads, chebi_ccd.json (ligand mapping)
 `-- <model>/
     |-- report.txt, report.json    what was done: REVIEW, then NEEDS_PARAMS, then INFO
     |-- prepped.pdb                trimmed protein + kept cofactors (heavy atoms)
@@ -361,7 +394,9 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 
 | Flag | What to do |
 |---|---|
-| AlphaFill ligand sits in a UniProt site with no code mapping | add `--name-map "NAME=CODE"` if you want it |
+| AlphaFill ligand sits in a UniProt site with no code mapping | add `--name-map "NAME=CODE"` if you want it, or the pair to `NOT_A_MAPPING` if it is a coincidence |
+| AlphaFill ligand matches only when stereochemistry is ignored | check the CCD entry; add `--name-map "NAME=CODE,CODE"` (the fix is spelled out) to keep it |
+| UniProt cofactor has no CCD mapping | the reason is given (no ChEBI ID, no structure in ChEBI, no CCD match, lookup failed); add it to `LIGAND_NAME_TO_CCD` or use `--name-map` |
 | NEEDS_PARAMS: ligand NOT built (no matching RESI) | add its topology (e.g. CGenFF via `toppar_prepare.py --extra-stream`) or an alias in `CCD_ALIASES` |
 | NEEDS_PARAMS: cluster NOT built (bonded model needed) | add published parameters for the cluster and its bonds to the protein |
 | REVIEW: ligand NOT built (heavy-atom graph does not match) | the transplanted copy is likely incomplete or distorted; check `build/lig_*.pdb` |
@@ -385,7 +420,7 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 | `--retries` | 6 | attempts per download; dropped connections, timeouts and HTTP 429/5xx are retried with backoff (2, 4, 8, ... s) |
 | `--accession` | | UniProt accession, for single-model runs without header information |
 | `--no-uniprot` | | skip UniProt; with the binding-site rule, no cofactors are kept |
-| `--name-map NAME=CODE` | | map a UniProt ligand name to a PDB code (repeatable) |
+| `--name-map NAME=CODE[,CODE]` | | map a UniProt ligand name to one or more PDB codes, replacing the automatic mapping (repeatable) |
 | `--keep-ligands A,B` | | extra PDB codes to allow |
 | `--ignore-ligand NAME` | | UniProt ligand name to ignore, in addition to `IGNORED_LIGAND_NAMES` (repeatable) |
 
@@ -420,7 +455,8 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 | `--pdb2pqr` | `pdb2pqr` | executable |
 | `--pka-window` | 1.0 | report residues with pKa this close to the pH |
 | `--metal-cutoff` | 2.8 Å | metal-donor distance for extraBonds restraints and residue overrides |
-| `--metal-coord` | 2.6 Å | protein N/O/S this close to a metal count as its donors |
+| `--donor-tol` | 0.35 Å | a protein atom counts as a metal donor up to the metal's typical bond length plus this |
+| `--metal-shift` | 1 Å | largest move when fitting a transplanted metal ion to its donors; 0 disables |
 | `--min-metal-donors` | 3 | metal ions with fewer protein donors are kept only if a kept ligand bridges them |
 | `--metal-min-sep` | 3 Å | minimum distance between two metal ions in sites that share residues |
 | `--metal-k` | 100 | extraBonds force constant (kcal/mol/Å^2) |
@@ -453,7 +489,58 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 
 ---
 
-## 5. Known limitations
+## 5. `ligand_resolver.py` in detail
+
+UniProt identifies ligands by ChEBI ID; AlphaFill and the PDB use Chemical Component Dictionary (CCD) codes.
+`ligand_resolver.py` translates between the two.
+`af_prep.py` calls it for every ChEBI ID of a run before processing the models;
+it also works on its own:
+
+```bash
+python ligand_resolver.py CHEBI:30616 CHEBI:60344 --cache chebi_ccd.json
+```
+
+### Method
+
+UniProt usually cites the major microspecies at pH 7.3 (e.g. ATP(4-), CHEBI:30616), while CCD mostly stores neutral forms.
+Each ChEBI ID is therefore first expanded to its *protonation family*:
+the compounds linked to it by ChEBI's "is conjugate acid/base of" relations,
+restricted to those with the same InChIKey skeleton (connectivity only, no stereo or protonation).
+CCD entries are then searched with these methods, from strongest to weakest:
+
+| Method | Meaning |
+|---|---|
+| `chebi_xref` | the CCD entry cross-references the cited ChEBI ID |
+| `chebi_xref_conjugate` | ... or another protonation state of it |
+| `inchikey_exact` | the CCD InChIKey equals that of a family member; catches metal complexes such as heme, which a structure search misses |
+| `graph-relaxed-stereo` | RCSB structure match that keeps chirality, confirmed by the InChIKey skeleton |
+| `graph-relaxed` | structure match ignoring chirality, same skeleton: the CCD entry may leave stereo undefined (*stereo-ambiguous*); reported, not used |
+| `structure_similar` | structure match with a different skeleton: an analog such as ANP for ATP (*similar*); reported, never a match |
+
+Only the first four methods produce codes that `af_prep.py` uses.
+
+### Result status
+
+| Status | Meaning |
+|---|---|
+| `resolved` | at least one CCD code |
+| `generic` | ChEBI has no usable structure (a class, an R-group structure, or a cluster) and no CCD entry cross-references it |
+| `no_match` | ChEBI has a structure, but no CCD entry matches it strictly |
+| `failed` | a web service failed; not cached, so the next run retries |
+
+Only complete results are written to the cache file, so a temporary outage never leaves a wrong entry behind.
+Requests are retried on rate limits and server errors, and PubChem is queried at most 5 times per second.
+
+### Options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `chebi_ids` | | ChEBI IDs to resolve, e.g. `CHEBI:30616` |
+| `--cache` | | cache file to read and update |
+| `--workers` | 4 | parallel lookups |
+| `--refresh` | | ignore cached results |
+
+## 6. Known limitations
 
 - **Single structures only.** Each model is a single AlphaFold prediction, and UniProt binding sites are applied to every chain (homomers).
 - **Some cofactors have no parameters.** Covalent cofactors, iron-sulfur clusters, heme c, PLP, TPP, coenzyme A, biotin and molybdopterin have no standard CHARMM36 topology in this setup.
@@ -465,3 +552,5 @@ The UniProt entry (cached in `<outdir>/cache`) supplies:
 - **Dowser++ places waters by an energy threshold,** not by equilibrium sampling.
   Marginal waters can leave during equilibration.
 - **The AlphaFill URL template has not been verified.** If `--alphafill auto` fails, download the files and pass the folder instead.
+- **The ligand mapping depends on external databases.** ChEBI relations, CCD cross-references and RCSB search results can be incomplete;
+  a ligand that stays unmapped is reported, and `--name-map` or `LIGAND_NAME_TO_CCD` fixes it.

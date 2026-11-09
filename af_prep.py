@@ -445,15 +445,36 @@ def fetch_uniprot(acc, cache_dir):
     return r.json()
 
 
+_NUMBER_WORDS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+                 "five": 5, "six": 6, "seven": 7, "eight": 8}
+
+
+def cofactor_count(note):
+    """Copies per subunit from a UniProt cofactor note such as 'Binds 2 Mg(2+)
+    ions per subunit.' or 'Binds 1 FAD per subunit.'; 0 if not stated."""
+    m = re.search(r"\bBinds\s+(\d+|an?|one|two|three|four|five|six|seven|eight)\b"
+                  r"[^.;]*?\bper\s+(?:subunit|monomer|chain|polypeptide)", note or "", re.I)
+    if not m:
+        return 0
+    w = m.group(1).lower()
+    return int(w) if w.isdigit() else _NUMBER_WORDS.get(w, 0)
+
+
 def parse_uniprot(d):
     info = {"cofactors": [], "sites": [], "modified": [], "chains": [],
             "chebi": {},       # UniProt ligand name -> ChEBI ID
+            "cofactor_counts": {},   # cofactor name -> copies per subunit (from notes)
             "length": d.get("sequence", {}).get("length")}
     for cm in d.get("comments", []):
         if cm.get("commentType") == "COFACTOR":
+            note = " ".join(t.get("value", "") for t in (cm.get("note") or {}).get("texts", []))
+            n = cofactor_count(note)
             for c in cm.get("cofactors", []):
                 if c.get("name"):
                     info["cofactors"].append(c["name"])
+                    if n:
+                        info["cofactor_counts"][c["name"]] = max(
+                            n, info["cofactor_counts"].get(c["name"], 0))
                     xref = c.get("cofactorCrossReference") or {}
                     chebi = (ligand_resolver.normalize_chebi(xref.get("id"))
                              if xref.get("database") == "ChEBI" else None)
@@ -648,6 +669,9 @@ def kabsch(P, Q):
     return R, qc - pc @ R.T
 
 
+NOSITE = "*nosite*"      # label prefix of pseudo-sites for cofactors without residues
+
+
 SYMMETRIC_ATOMS = {"PHE": [("CD1", "CD2"), ("CE1", "CE2")],
                    "TYR": [("CD1", "CD2"), ("CE1", "CE2")],
                    "ASP": [("OD1", "OD2")], "GLU": [("OE1", "OE2")],
@@ -749,6 +773,93 @@ def transplant_ligands(ligs, af_protein, protein, cfg, rep):
     return out, metrics
 
 
+# Typical metal-donor distances (A), from small-molecule and protein structure
+# surveys; a protein atom counts as a donor up to the ideal distance + --donor-tol.
+METAL_IDEAL = {
+    "ZN": {"S": 2.33, "N": 2.08, "O": 2.08}, "MG": {"O": 2.08, "N": 2.20},
+    "CA": {"O": 2.40, "N": 2.50}, "MN": {"O": 2.18, "N": 2.25, "S": 2.40},
+    "FE": {"O": 2.10, "N": 2.15, "S": 2.30}, "CO": {"O": 2.10, "N": 2.12, "S": 2.30},
+    "NI": {"O": 2.08, "N": 2.10, "S": 2.20}, "CU": {"O": 2.00, "N": 2.02, "S": 2.20},
+    "CD": {"O": 2.30, "N": 2.30, "S": 2.50}, "HG": {"S": 2.40, "N": 2.30, "O": 2.40},
+    "NA": {"O": 2.42, "N": 2.50}, "K": {"O": 2.80, "N": 2.90},
+}
+# protein atoms that can coordinate a metal (side-chain O/N/S and backbone O)
+DONOR_NAMES = {"O", "OXT", "OT1", "OT2", "OD1", "OD2", "OE1", "OE2", "SG", "SD",
+               "OG", "OG1", "OH"}
+
+
+def metal_ideal(metal, donor_el):
+    return METAL_IDEAL.get(metal, {}).get(donor_el, 2.2)
+
+
+def metal_reach(metal, cfg):
+    """Largest donor distance counted for this metal."""
+    return max(METAL_IDEAL.get(metal, {"X": 2.2}).values()) + cfg.donor_tol
+
+
+def is_donor(a):
+    """Can this protein atom coordinate a metal? (not backbone or amide N)"""
+    if a.name in DONOR_NAMES:
+        return True
+    return a.name in ("ND1", "NE2") and a.resname in ("HIS", "HSD", "HSE", "HSP")
+
+
+def metal_donors(p, metal, atoms, tree, cfg):
+    """Indices of donor atoms within ideal distance + tolerance of point p."""
+    out = set()
+    for i in tree.query_ball_point(p, metal_reach(metal, cfg)):
+        a = atoms[i]
+        if is_donor(a) and np.linalg.norm(p - np.array(a.xyz)) <= \
+                metal_ideal(metal, a.element) + cfg.donor_tol:
+            out.add(i)
+    return out
+
+
+def refine_metal(p0, metal, atoms, tree, cfg):
+    """Move a transplanted metal ion by at most cfg.metal_shift A to where its
+    potential donors sit at ideal distances, keeping other atoms at a distance.
+    Corrects the small mismatch between the homolog's coordination geometry and
+    the model's side chains.  Returns (position, shift, donor indices); the
+    position is only changed if that does not lose donors."""
+    p0 = np.asarray(p0, dtype=float)
+    before = metal_donors(p0, metal, atoms, tree, cfg)
+    if cfg.metal_shift <= 0:
+        return p0, 0.0, before
+    reach = metal_reach(metal, cfg) + cfg.metal_shift
+    near = tree.query_ball_point(p0, reach + 1.0)
+    don = [i for i in near if is_donor(atoms[i])
+           and np.linalg.norm(p0 - np.array(atoms[i].xyz)) <= reach]
+    if not don:
+        return p0, 0.0, before
+    X = coords([atoms[i] for i in don])
+    D = np.array([metal_ideal(metal, atoms[i].element) for i in don])
+    oth = [i for i in near if i not in set(don)]
+    Y = coords([atoms[i] for i in oth])
+    R = np.array([2.9 if atoms[i].element == "C" else 2.6 for i in oth])
+    cap = 0.6 ** 2          # donors that cannot be reached stop pulling
+
+    def f(p):
+        d = np.linalg.norm(X - p, axis=1)
+        e = np.minimum((d - D) ** 2, cap).sum()
+        if len(Y):
+            e += 10 * (np.maximum(0, R - np.linalg.norm(Y - p, axis=1)) ** 2).sum()
+        e += 10 * max(0.0, np.linalg.norm(p - p0) - cfg.metal_shift) ** 2
+        return e
+
+    from scipy.optimize import minimize
+    best = min((minimize(f, p0 + dp, method="Nelder-Mead",
+                         options={"xatol": 1e-3, "fatol": 1e-5})
+                for dp in [np.zeros(3)] + [0.4 * v for v in np.eye(3)] +
+                [-0.4 * v for v in np.eye(3)]), key=lambda r: r.fun)
+    p = best.x
+    if np.linalg.norm(p - p0) > cfg.metal_shift + 0.05:
+        return p0, 0.0, before
+    after = metal_donors(p, metal, atoms, tree, cfg)
+    if len(after) < len(before) or (len(after) == len(before) and f(p) >= f(p0)):
+        return p0, 0.0, before
+    return p, float(np.linalg.norm(p - p0)), after
+
+
 def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_rmsd,
                    cofactor_ccds, cfg, rep):
     """Keep ligands that sit in a UniProt-annotated binding site for that ligand
@@ -792,31 +903,41 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
             no_sites.add(ccd)
             continue
         la = heavy(atoms) or atoms
+        metal = len(la) == 1 and la[0].element in METAL_ELEMENTS
+        shift, donors = 0.0, set()
+        if metal:
+            p, shift, donors = refine_metal(la[0].xyz, la[0].element, ph, tree, cfg)
+            la = [replace(la[0], x=float(p[0]), y=float(p[1]), z=float(p[2]))]
+            atoms = la
         xyz = coords(la)
         d, _ = tree.query(xyz)
-        metal = len(la) == 1 and la[0].element in METAL_ELEMENTS
         # metal atoms (also inside clusters and hemes) bond to protein N/O/S at
         # ~2.0-2.4 A, so they only clash below --metal-clash
         thr = np.array([cfg.metal_clash if a.element in METAL_ELEMENTS else cfg.clash
                         for a in la])
         clashes = int(np.sum(d < thr))
-        donors = ({i for i in tree.query_ball_point(xyz[0], cfg.metal_coord)
-                   if ph[i].element in ("N", "O", "S")} if metal else set())
         burial = float(np.mean(d <= cfg.burial_dist))
         near = {(ph[i].chain, ph[i].resnum)
                 for lst in tree.query_ball_point(xyz, cfg.site_contact) for i in lst}
-        # coverage of each annotated site, per chain (homomers: each chain has it)
-        touched = {}
-        for (ch, rn) in near:
-            for label, res in groups.items():
-                if rn in res:
-                    touched[(ch, label)] = touched.get((ch, label), 0) + 1
-        if not touched:
-            rep.info(f"dropped {tag} (touches no annotated binding-site residue)")
-            continue
-        coverage = {k: n / len(groups[k[1]]) for k, n in touched.items()}
+        nosite = all(lb.startswith(NOSITE) for lb in groups)
+        if nosite:
+            # cofactor without annotated residues: any chain the copy sits in;
+            # it must pass the fit tests (and, for metals, coordination) instead
+            chs = {ch for ch, _ in near} or {ph[int(tree.query(xyz[0])[1])].chain}
+            coverage = {(ch, lb): 1.0 for ch in chs for lb in groups}
+        else:
+            # coverage of each annotated site, per chain (homomers: each chain has it)
+            touched = {}
+            for (ch, rn) in near:
+                for label, res in groups.items():
+                    if rn in res:
+                        touched[(ch, label)] = touched.get((ch, label), 0) + 1
+            if not touched:
+                rep.info(f"dropped {tag} (touches no annotated binding-site residue)")
+                continue
+            coverage = {k: n / len(groups[k[1]]) for k, n in touched.items()}
         cands.append(dict(key=key, ccd=ccd, atoms=atoms, xyz=xyz, metal=metal,
-                          el=[a.element for a in la],
+                          el=[a.element for a in la], shift=shift, nosite=nosite,
                           clashes=clashes, burial=burial, coverage=coverage, tag=tag,
                           donors=donors, cofactor=ccd in cofactor_ccds))
     if not_in_uniprot:
@@ -840,10 +961,10 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
         else:
             rep.info(f"{n} AlphaFill {ccd} copy(ies) in the binding site for '{name}' "
                      f"are a related compound (analog), not kept; {fix} would keep them")
-    for ccd in sorted(no_sites):
+    for ccd in sorted(no_sites):          # e.g. --keep-ligands codes without a site
         (rep.review if ccd in cofactor_ccds else rep.info)(
-            f"{ccd} is annotated in UniProt but without binding-site residues; no copy "
-            "kept (place it manually if needed)")
+            f"{ccd} has no annotated binding site; no copy kept (place it manually if "
+            "needed)")
 
     # Fit tests on the model's pocket: a pocket that is apo-like (collapsed or
     # opened up) shows up as clashes, low burial or low coverage of the site.
@@ -855,6 +976,8 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
             f.append(f"burial {c['burial']:.0%}")
         if cov < cfg.min_site_coverage:
             f.append(f"site coverage {cov:.0%}")
+        if c["nosite"] and c["metal"] and len(c["donors"]) < cfg.min_metal_donors:
+            f.append(f"only {len(c['donors'])} protein donor(s)")
         return f
 
     # best-fitting copies first
@@ -918,10 +1041,13 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
         c["site"] = site
         c["site_label"] = site[1]
         kept.append(c)
-        label = f" site {site[1]}" if site[1] else ""
+        label = f" site {site[1]}" if site[1] and not site[1].startswith(NOSITE) else ""
         fit = fit_rmsd.get(c["key"])
         fit = f", {fit}" if fit else ""
-        coord = f", {len(c['donors'])} protein donors" if c["metal"] else ""
+        coord = (f", {len(c['donors'])} protein donors" if c["metal"] else "") + \
+            (f", moved {c['shift']:.1f} A to fit its donors" if c["shift"] >= 0.05 else "") + \
+            (", no annotated site: placed by fit" + (" and coordination" if c["metal"] else "")
+             if c["nosite"] else "")
         c["kept_msg"] = (f"kept {c['tag']} at chain {site[0]}{label} (burial "
                          f"{c['burial']:.0%}, site coverage {cov:.0%}, clashes "
                          f"{c['clashes']}{coord}{fit})")
@@ -930,8 +1056,10 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
     # or nucleotide (e.g. Mg.ATP): keep them only if such a partner is kept too.
     low_coord, dropped = {}, set()
     for c in [k for k in kept if k["metal"] and len(k["donors"]) < cfg.min_metal_donors]:
+        m_el = c["el"][0]
         partners = [k["tag"] for k in kept if not k["metal"] and any(
-            el in ("O", "N", "S") and np.linalg.norm(p - c["xyz"][0]) <= cfg.metal_coord
+            el in ("O", "N", "S") and np.linalg.norm(p - c["xyz"][0])
+            <= metal_ideal(m_el, el) + cfg.donor_tol
             for el, p in zip(k["el"], k["xyz"]))]
         n = len(c["donors"])
         if partners:
@@ -941,11 +1069,26 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
         dropped.add(c["tag"])
         filled.discard((c["ccd"],) + c["site"])
         low_coord[(c["ccd"],) + c["site"]] = (
-            f"{c['tag']} dropped: only {n} protein donor(s) within {cfg.metal_coord} A "
+            f"{c['tag']} dropped: only {n} protein donor(s) within bonding distance "
             "and no partner ligand kept (substrate-bridged ion, or a site completed "
             "by waters?)")
     for c in kept:
         rep.info(c["kept_msg"])
+
+    # cofactors without annotated residues that got no copy at all
+    for ccd, groups in site_res.items():
+        if not all(lb.startswith(NOSITE) for lb in groups):
+            continue
+        if any(k["ccd"] == ccd for k in kept):
+            continue
+        why = next((w for k, w in best_reject.items() if k[0] == ccd), None) or \
+            next((w for k, w in low_coord.items() if k[0] == ccd), None)
+        why = (f"best copy did not fit: {why}" if why else
+               "no transplanted copy" if not any(c["ccd"] == ccd for c in cands) else
+               "no copy passed")
+        (rep.review if ccd in cofactor_ccds else rep.info)(
+            f"{ccd} is annotated in UniProt but without binding-site residues; none "
+            f"placed ({why})")
 
     # annotated sites (per chain) that ended up without a ligand
     for ccd, groups in site_res.items():
@@ -1368,8 +1511,8 @@ COORD_ATOMS = {("HIS", "ND1"), ("HIS", "NE2"), ("CYS", "SG"), ("ASP", "OD1"),
 
 def metal_sites(prot_heavy, orig_resname, ligands, cfg):
     """List of (ligand dict, metal Atom, protein Atom, distance)."""
-    pts = [a for a in prot_heavy
-           if (orig_resname.get((a.chain, a.resnum)), a.name) in COORD_ATOMS]
+    pts = [a for a in prot_heavy if is_donor(a) or
+           (orig_resname.get((a.chain, a.resnum)), a.name) in COORD_ATOMS]
     if not pts:
         return []
     tree = cKDTree(coords(pts))
@@ -1378,9 +1521,12 @@ def metal_sites(prot_heavy, orig_resname, ligands, cfg):
         for m in lig["atoms"]:
             if m.element not in METAL_ELEMENTS:
                 continue
-            for i in tree.query_ball_point(m.xyz, cfg.metal_cutoff):
+            reach = max(cfg.metal_cutoff, metal_reach(m.element, cfg))
+            for i in tree.query_ball_point(m.xyz, reach):
                 d = float(np.linalg.norm(np.subtract(m.xyz, pts[i].xyz)))
-                sites.append((lig, m, pts[i], d))
+                if d <= max(cfg.metal_cutoff, metal_ideal(m.element, pts[i].element)
+                            + cfg.donor_tol):
+                    sites.append((lig, m, pts[i], d))
     return sites
 
 
@@ -1882,6 +2028,16 @@ def process(model, cfg):
                                           else a.resname) for a in protein}
 
     cofactor_ccds = {c for ccds in expected for c in ccds}
+    # cofactors UniProt names without binding-site residues: pseudo-sites, one per
+    # copy UniProt's note gives ("Binds 2 Mg(2+) ions per subunit"), else one
+    if uni:
+        counts = {}
+        for name in uni["cofactors"]:
+            m = rep.data.get("ligand_mapping", {}).get(name, {})
+            for c in m.get("codes", []):
+                counts[c] = max(counts.get(c, 1), uni["cofactor_counts"].get(name, 1))
+        for c in sorted(cofactor_ccds - set(site_res)):
+            site_res[c] = {f"{NOSITE}{k}": set() for k in range(1, counts.get(c, 1) + 1)}
     ligands = (select_ligands(protein, ligs, allowed, site_res, unmapped, related,
                               fit_rmsd, cofactor_ccds, cfg, rep) if ligs else [])
     for lig in ligands:                           # UniProt names of the site each one fills
@@ -1891,8 +2047,12 @@ def process(model, cfg):
     found = {l["ccd"] for l in ligands}
     for ccds in expected:
         if not found & set(ccds):
-            rep.review(f"annotated cofactor {'/'.join(ccds)} not placed - "
-                       "consider co-folding (Boltz/Chai-1) or a homolog structure")
+            msg = (f"annotated cofactor {'/'.join(ccds)} not placed - "
+                   "consider co-folding (Boltz/Chai-1) or a homolog structure")
+            # a site-level line already says what happened: keep this one as INFO
+            explained = any(lvl == "REVIEW" and any(m.startswith(f"{c} ") for c in ccds)
+                            for lvl, m in rep.flags)
+            (rep.info if explained else rep.review)(msg)
     lig_atoms = [a for l in ligands for a in l["atoms"]]
     write_pdb(heavy(protein) + heavy(lig_atoms), outdir / "prepped.pdb")
 
@@ -2156,8 +2316,12 @@ def main(argv=None):
     p.add_argument("--pka-window", type=float, default=1.0)
     p.add_argument("--metal-cutoff", type=float, default=2.8,
                    help="metal-donor distance for extraBonds restraints and overrides (A)")
-    p.add_argument("--metal-coord", type=float, default=2.6,
-                   help="protein N/O/S this close to a metal count as its donors (A)")
+    p.add_argument("--donor-tol", type=float, default=0.35,
+                   help="a protein O/N/S counts as a metal donor up to the metal's typical "
+                        "bond length plus this (A)")
+    p.add_argument("--metal-shift", type=float, default=1.0,
+                   help="largest move (A) when fitting a transplanted metal ion to its "
+                        "donors; 0 disables")
     p.add_argument("--min-metal-donors", type=int, default=3,
                    help="metal ions with fewer protein donors are kept only if a kept "
                         "ligand bridges them (e.g. Mg.ATP); otherwise dropped and flagged")
