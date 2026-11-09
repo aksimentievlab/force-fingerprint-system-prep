@@ -140,7 +140,7 @@ IGNORED_LIGAND_NAMES = {
     "substrate", "product", "a protein", "DNA", "RNA", "tRNA", "mRNA", "rRNA",
     "chitin", "peptidoglycan", "a carbohydrate", "a beta-lactam", "an acyl-CoA",
     "an L-alpha-amino acid", "a 2'-deoxyribonucleoside 5'-triphosphate", "pyridine",
-    "pepstatin A"               # inhibitor
+    "pepstatin A",              # inhibitor
 }
 
 # (UniProt ligand name, PDB code) pairs that are known coincidences: the
@@ -168,10 +168,11 @@ NOT_A_MAPPING = {
     ("ADP-alpha-D-glucose", "COA"), ("4-coumaroyl-CoA", "COA"),
     ("N(7)-methyl-GMP", "CTN"), ("N(7)-methyl-GMP", "U5P"),
 }
-NOT_A_MAPPING.update({ ("(E)-5-hydroxyferulate", ccd) for ccd in
-                       ("FE","STL","SLX","SFG","SAM","PPY","N7I","EUG","ENO","EMO","DNA","CIY","AGI") })
-NOT_A_MAPPING.update({ ("UDP-beta-L-rhamose", ccd) for ccd in
-                       ("KMP","SAL","NAR","MG","B3P") })
+NOT_A_MAPPING.update({("(E)-5-hydroxyferulate", ccd) for ccd in
+                      ("FE", "STL", "SLX", "SFG", "SAM", "PPY", "N7I", "EUG", "ENO", "EMO",
+                       "DNA", "CIY", "AGI")})
+NOT_A_MAPPING.update({("UDP-beta-L-rhamnose", ccd) for ccd in
+                      ("KMP", "SAL", "NAR", "MG", "B3P")})
 
 # PDB-code -> CHARMM aliases and UniProt state -> CHARMM residue come from the
 # toppar folder (ccd_aliases.json, uniprot_states.json, written by
@@ -311,6 +312,7 @@ class Report:
         self.name = name
         self.flags = []
         self.data = OrderedDict()
+        self.candidates = []     # empty sites with their candidate copies (candidates.pdb)
 
     def review(self, msg):
         log.warning("[%s] REVIEW: %s", self.name, msg)
@@ -469,7 +471,9 @@ def parse_uniprot(d):
     info = {"cofactors": [], "sites": [], "modified": [], "chains": [],
             "chebi": {},       # UniProt ligand name -> ChEBI ID
             "cofactor_counts": {},   # cofactor name -> copies per subunit (from notes)
-            "length": d.get("sequence", {}).get("length")}
+            "length": d.get("sequence", {}).get("length"),
+            "protein_name": ((d.get("proteinDescription") or {}).get("recommendedName") or
+                             {}).get("fullName", {}).get("value", "")}
     for cm in d.get("comments", []):
         if cm.get("commentType") == "COFACTOR":
             note = " ".join(t.get("value", "") for t in (cm.get("note") or {}).get("texts", []))
@@ -726,14 +730,23 @@ def transplant_ligands(ligs, af_protein, protein, cfg, rep):
     keys = [k for k in af_res if "CA" in af_res[k] and k in in_res and "CA" in in_res[k]]
     if len(keys) < 3:
         rep.review("AlphaFill and input model share too few residues; ligands dropped")
-        return OrderedDict(), {}
+        return OrderedDict(), {}, []
     af_ca = np.array([af_res[k]["CA"] for k in keys])
     in_ca = np.array([in_res[k]["CA"] for k in keys])
     ca_tree = cKDTree(af_ca)
     af_heavy, in_heavy = heavy(af_protein), heavy(protein)
     af_tree, in_tree = cKDTree(coords(af_heavy)), cKDTree(coords(in_heavy))
     ident = lambda a: (a.chain, a.resnum, a.name)
-    out, metrics, poor = OrderedDict(), {}, []
+    out, metrics, poor, rejected = OrderedDict(), {}, [], []
+
+    def reject(key, atoms, R, t, why):
+        """Keep a not-transferred copy, placed with its fit, for candidates.pdb."""
+        la = heavy(atoms) or atoms
+        new = coords(la) @ R.T + t
+        rejected.append({"key": key, "why": why,
+                         "atoms": [replace(a, x=float(p[0]), y=float(p[1]), z=float(p[2]))
+                                   for a, p in zip(la, new)]})
+
     for key, atoms in ligs.items():
         tag = f"{key[3]} {key[0]}{key[1]}"
         xyz = coords(heavy(atoms) or atoms)
@@ -745,6 +758,7 @@ def transplant_ligands(ligs, af_protein, protein, cfg, rep):
         fit = float(np.sqrt(np.mean(np.sum((af_ca[idx] @ R.T + t - in_ca[idx]) ** 2, 1))))
         if fit > cfg.max_fit_rmsd:
             poor.append(f"{tag}: backbone fit {fit:.2f} A")
+            reject(key, atoms, R, t, f"not transferred: backbone fit {fit:.2f} A")
             continue
         new_xyz = xyz @ R.T + t
         # pocket residues and contacts in AlphaFill's frame
@@ -759,12 +773,14 @@ def transplant_ligands(ligs, af_protein, protein, cfg, rep):
         prmsd = _pocket_rmsd(pocket, af_res, in_res, R, t)
         if prmsd == prmsd and prmsd > cfg.max_pocket_rmsd:      # not NaN
             poor.append(f"{tag}: pocket side chains {prmsd:.2f} A")
+            reject(key, atoms, R, t, f"not transferred: pocket side chains {prmsd:.2f} A")
             continue
         in_contacts = {ident(in_heavy[i]) for lst in
                        in_tree.query_ball_point(new_xyz, cfg.contact_dist) for i in lst}
         frac = len(af_contacts & in_contacts) / len(af_contacts) if af_contacts else 1.0
         if frac < cfg.min_contact_frac:
             poor.append(f"{tag}: {frac:.0%} of contacts kept")
+            reject(key, atoms, R, t, f"not transferred: {frac:.0%} of contacts kept")
             continue
         out[key] = [replace(a, x=float(p[0]), y=float(p[1]), z=float(p[2]))
                     for a, p in zip(heavy(atoms) or atoms, new_xyz)]
@@ -775,7 +791,7 @@ def transplant_ligands(ligs, af_protein, protein, cfg, rep):
         rep.info(f"{len(poor)} AlphaFill ligand(s) not transferred because the pocket "
                  f"differs between models: {'; '.join(poor[:10])}"
                  + (" ..." if len(poor) > 10 else ""))
-    return out, metrics
+    return out, metrics, rejected
 
 
 # Typical metal-donor distances (A), from small-molecule and protein structure
@@ -865,8 +881,61 @@ def refine_metal(p0, metal, atoms, tree, cfg):
     return p, float(np.linalg.norm(p - p0)), after
 
 
+def _sphere_dirs(n=60):
+    i = np.arange(n) + 0.5
+    phi, th = np.arccos(1 - 2 * i / n), math.pi * (1 + 5 ** 0.5) * i
+    return np.c_[np.cos(th) * np.sin(phi), np.sin(th) * np.sin(phi), np.cos(phi)]
+
+
+_DIRS = _sphere_dirs()
+
+
+def water_space(p, metal, tree):
+    """Is there room for a water molecule at bonding distance from the ion,
+    i.e. a point at the metal-O distance with no protein heavy atom within 2.6 A?
+    (The water could come from solvation or from Dowser++.)"""
+    pts = np.asarray(p) + metal_ideal(metal, "O") * _DIRS
+    d, _ = tree.query(pts)
+    return bool(np.any(d >= 2.6))
+
+
+def metal_element(ccd):
+    el = re.sub(r"\d", "", ccd)
+    return el if el in METAL_ELEMENTS else None
+
+
+def place_metal_from_site(metal, ch, residues, atoms, tree, cfg):
+    """Position for a metal ion at an annotated site without a usable copy:
+    refine from the centroids of donor pairs/triples of the annotated residues.
+    Returns (position, donor indices) of the best try, or (None, set())."""
+    from itertools import combinations
+    import types
+    don = [i for i, a in enumerate(atoms) if a.chain == ch and a.resnum in residues
+           and is_donor(a)]
+    if len({atoms[i].resnum for i in don}) < 2:
+        return None, set()
+    X = {i: np.array(atoms[i].xyz) for i in don}
+    starts = [np.mean(list(X.values()), axis=0)]
+    for k in (3, 2):
+        for c in combinations(don, k):
+            if len({atoms[i].resnum for i in c}) == k and \
+                    max(np.linalg.norm(X[a] - X[b]) for a, b in combinations(c, 2)) < 6.0:
+                starts.append(np.mean([X[i] for i in c], axis=0))
+            if len(starts) > 80:
+                break
+    wide = types.SimpleNamespace(**{**vars(cfg), "metal_shift": cfg.denovo_shift})
+    best, best_don = None, set()
+    for p0 in starts:
+        p, _, d = refine_metal(p0, metal, atoms, tree, wide)
+        if tree.query(p)[0] < cfg.metal_clash:
+            continue
+        if len(d) > len(best_don):
+            best, best_don = p, d
+    return best, best_don
+
+
 def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_rmsd,
-                   cofactor_ccds, cfg, rep):
+                   cofactor_ccds, cfg, rep, rejected=()):
     """Keep ligands that sit in a UniProt-annotated binding site for that ligand
     and fit the model's pocket (no clashes, buried, covering the site), at most
     one copy per site and chain."""
@@ -880,6 +949,19 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
     cands, no_sites = [], set()
     not_in_uniprot, unmapped_hits = Counter(), {}
     related_hits = Counter()      # (name, code, kind): loose matches in mapped sites
+    others = []                   # not selectable, but listed as candidates for review
+    NEAR = 8.0                    # A: how close a candidate must be to an empty site
+
+    def site_touch(xyz, groups, radius):
+        near = {(ph[i].chain, ph[i].resnum)
+                for lst in tree.query_ball_point(xyz, radius) for i in lst}
+        touched = {}
+        for (ch, rn) in near:
+            for label, res in groups.items():
+                if rn in res:
+                    touched[(ch, label)] = touched.get((ch, label), 0) + 1
+        return {k: n / len(groups[k[1]]) for k, n in touched.items()}
+
     for key, atoms in ligands.items():
         ccd = key[3]
         tag = f"{ccd} {key[0]}{key[1]}"
@@ -939,12 +1021,55 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
                         touched[(ch, label)] = touched.get((ch, label), 0) + 1
             if not touched:
                 rep.info(f"dropped {tag} (touches no annotated binding-site residue)")
+                wide = site_touch(xyz, groups, NEAR)
+                if wide:
+                    others.append(dict(key=key, ccd=ccd, atoms=atoms, xyz=xyz, metal=metal,
+                                       el=[a.element for a in la], shift=shift, nosite=False,
+                                       clashes=clashes, burial=burial, coverage=wide,
+                                       donors=donors, stage=1, tag=tag,
+                                       why=f"no annotated residue within {cfg.site_contact} A",
+                                       cofactor=ccd in cofactor_ccds))
                 continue
             coverage = {k: n / len(groups[k[1]]) for k, n in touched.items()}
         cands.append(dict(key=key, ccd=ccd, atoms=atoms, xyz=xyz, metal=metal,
                           el=[a.element for a in la], shift=shift, nosite=nosite,
                           clashes=clashes, burial=burial, coverage=coverage, tag=tag,
-                          donors=donors, cofactor=ccd in cofactor_ccds))
+                          donors=donors, cofactor=ccd in cofactor_ccds,
+                          water=metal and water_space(xyz[0], la[0].element, tree)))
+    # copies rejected during transfer: not selectable, but listed as candidates
+    # for empty sites (placed with their fit, metal positions refined)
+    for r in rejected:
+        ccd = r["key"][3]
+        groups = site_res.get(ccd)
+        if ccd not in allowed or not groups:
+            continue
+        la = r["atoms"]
+        metal = len(la) == 1 and la[0].element in METAL_ELEMENTS
+        shift, donors = 0.0, set()
+        if metal:
+            p, shift, donors = refine_metal(la[0].xyz, la[0].element, ph, tree, cfg)
+            la = [replace(la[0], x=float(p[0]), y=float(p[1]), z=float(p[2]))]
+        xyz = coords(la)
+        d, _ = tree.query(xyz)
+        thr = np.array([cfg.metal_clash if a.element in METAL_ELEMENTS else cfg.clash
+                        for a in la])
+        near = {(ph[i].chain, ph[i].resnum)
+                for lst in tree.query_ball_point(xyz, cfg.site_contact) for i in lst}
+        nosite = all(lb.startswith(NOSITE) for lb in groups)
+        if nosite:
+            chs = {ch for ch, _ in near} or {ph[int(tree.query(xyz[0])[1])].chain}
+            coverage = {(ch, lb): 1.0 for ch in chs for lb in groups}
+        else:
+            coverage = site_touch(xyz, groups, NEAR)
+            if not coverage:
+                continue
+        others.append(dict(key=r["key"], ccd=ccd, atoms=la, xyz=xyz, metal=metal,
+                           el=[a.element for a in la], shift=shift, nosite=nosite,
+                           clashes=int(np.sum(d < thr)), burial=float(np.mean(d <= cfg.burial_dist)),
+                           coverage=coverage, donors=donors, stage=1, why=r["why"],
+                           tag=f"{ccd} {r['key'][0]}{r['key'][1]}",
+                           cofactor=ccd in cofactor_ccds))
+
     if not_in_uniprot:
         rep.info("dropped AlphaFill ligands not mentioned in UniProt: " +
                  ", ".join(f"{c} x{n}" for c, n in not_in_uniprot.most_common()))
@@ -981,8 +1106,10 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
             f.append(f"burial {c['burial']:.0%}")
         if cov < cfg.min_site_coverage:
             f.append(f"site coverage {cov:.0%}")
-        if c["nosite"] and c["metal"] and len(c["donors"]) < cfg.min_metal_donors:
-            f.append(f"only {len(c['donors'])} protein donor(s)")
+        n = len(c["donors"])
+        if c["nosite"] and c["metal"] and n < cfg.min_metal_donors and not (
+                n == cfg.min_metal_donors - 1 and c.get("water")):
+            f.append(f"only {n} protein donor(s)")
         return f
 
     # best-fitting copies first
@@ -1011,6 +1138,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
     for c in cands:
         open_sites = [k for k in c["coverage"] if (c["ccd"],) + k not in filled]
         if not open_sites:
+            c["why"] = "site already has a better-placed copy"
             rep.info(f"dropped {c['tag']} (site already has a better-placed copy)")
             continue
         # best coverage; among equals, the site fewest other copies could fill
@@ -1021,6 +1149,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
         cov = c["coverage"][site]
         fail = failures(c, cov)
         if fail:
+            c["why"] = "does not fit: " + ", ".join(fail)
             for k in c["coverage"]:
                 best_reject.setdefault((c["ccd"],) + k, ", ".join(fail))
             rep.info(f"dropped {c['tag']} (does not fit the model's pocket: "
@@ -1028,6 +1157,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
             continue
         if any(np.min(np.linalg.norm(c["xyz"][:, None] - k["xyz"][None], axis=2))
                < cfg.overlap for k in kept):
+            c["why"] = "overlaps a kept ligand"
             rep.info(f"dropped {c['tag']} (overlaps a kept ligand)")
             continue
         # same ligand already placed in an overlapping site of this chain?
@@ -1039,6 +1169,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
         verdicts = [coexists(c, k) for k in clash_with]
         if any(not ok for ok, _ in verdicts):
             why = next(w for ok, w in verdicts if not ok)
+            c["why"] = why
             covered.setdefault((c["ccd"],) + site, clash_with[0]["tag"])
             rep.info(f"dropped {c['tag']} ({why})")
             continue
@@ -1059,7 +1190,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
 
     # Metal ions held by few protein atoms are usually completed by a substrate
     # or nucleotide (e.g. Mg.ATP): keep them only if such a partner is kept too.
-    low_coord, dropped = {}, set()
+    low_coord, dropped, warn = {}, set(), []
     for c in [k for k in kept if k["metal"] and len(k["donors"]) < cfg.min_metal_donors]:
         m_el = c["el"][0]
         partners = [k["tag"] for k in kept if not k["metal"] and any(
@@ -1070,15 +1201,98 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
         if partners:
             c["kept_msg"] += f"; bridged by {', '.join(partners)}"
             continue
+        if n == cfg.min_metal_donors - 1 and c.get("water"):
+            c["water_completed"] = True
+            warn.append(f"{c['tag']} kept with only {n} protein donors: room for water at "
+                        "bonding distance to complete its coordination - check the site")
+            continue
         kept.remove(c)
         dropped.add(c["tag"])
+        c["why"] = f"only {n} protein donor(s), no partner ligand kept"
         filled.discard((c["ccd"],) + c["site"])
         low_coord[(c["ccd"],) + c["site"]] = (
             f"{c['tag']} dropped: only {n} protein donor(s) within bonding distance "
             "and no partner ligand kept (substrate-bridged ion, or a site completed "
             "by waters?)")
     for c in kept:
+        if c["nosite"] and c["metal"] and len(c["donors"]) < cfg.min_metal_donors \
+                and not c.get("water_completed"):
+            c["water_completed"] = True
+            warn.append(f"{c['tag']} kept with only {len(c['donors'])} protein donors: room "
+                        "for water at bonding distance to complete its coordination - check")
+
+    # Metal sites still empty: place the ion from the annotated residues' donor
+    # atoms when no transplanted copy could be used.
+    for ccd, groups in site_res.items():
+        metal = metal_element(ccd)
+        if not metal:
+            continue
+        for label, residues in groups.items():
+            if label.startswith(NOSITE):
+                continue
+            for ch in chains:
+                if (ccd, ch, label) in filled or not residues & chain_res.get(ch, set()):
+                    continue
+                if any(k["ccd"] == ccd and k["site"][0] == ch and
+                       overlapping(ccd, k["site"][1], label) for k in kept):
+                    continue
+                p, don = place_metal_from_site(metal, ch, residues, ph, tree, cfg)
+                if p is None:
+                    continue
+                n = len(don)
+                water = water_space(p, metal, tree)
+                if n < cfg.min_metal_donors and not (n == cfg.min_metal_donors - 1 and water):
+                    continue
+                if any(k["metal"] and np.linalg.norm(p - k["xyz"][0]) < cfg.metal_min_sep
+                       for k in kept) or any(
+                        np.min(np.linalg.norm(k["xyz"] - p, axis=1)) < cfg.overlap
+                        for k in kept):
+                    continue
+                k_new = sum(1 for k in kept if k["key"][0] == "new") + 1
+                atom = Atom("HETATM", metal, ccd, ch, k_new, "", float(p[0]), float(p[1]),
+                            float(p[2]), 0.0, metal)
+                c = dict(key=("new", k_new, "", ccd), ccd=ccd, atoms=[atom],
+                         xyz=coords([atom]), metal=True, el=[metal], shift=0.0,
+                         nosite=False, clashes=0, burial=1.0,
+                         coverage={(ch, label): 1.0}, donors=don, water=water,
+                         cofactor=ccd in cofactor_ccds, tag=f"{ccd} new{k_new}",
+                         site=(ch, label), site_label=label)
+                lb = f" site {label}" if label else ""
+                c["kept_msg"] = (f"placed {ccd} at chain {ch}{lb} from the annotated "
+                                 f"residues' donor atoms (no usable AlphaFill copy; "
+                                 f"{n} protein donors)")
+                if n < cfg.min_metal_donors:
+                    c["water_completed"] = True
+                    warn.append(f"{c['tag']} placed with only {n} protein donors: room for "
+                                "water at bonding distance to complete its coordination - "
+                                "check the site")
+                kept.append(c)
+                filled.add((ccd, ch, label))
+                low_coord.pop((ccd, ch, label), None)
+    for c in kept:
         rep.info(c["kept_msg"])
+    for w in warn:
+        rep.review(w)
+
+    # Empty sites with the copies that were considered for them, for review:
+    # written to candidates.pdb (B-factor = site number, occupancy = rank).
+    kept_ids = {id(k) for k in kept}
+
+    def rank_key(c):
+        cov = max(c["coverage"].values())
+        return (c.get("stage", 0), len(failures(c, cov)), -len(c["donors"]),
+                c["clashes"], -cov, -c["burial"])
+
+    def candidates_note(ccd, ch, label, residues):
+        pool = [c for c in cands + others if c["ccd"] == ccd and id(c) not in kept_ids
+                and (ch, label) in c["coverage"]]
+        idx = len(rep.candidates) + 1
+        rep.candidates.append(dict(
+            site=idx, ccd=ccd, chain=ch, label=label, residues=sorted(residues),
+            cofactor=ccd in cofactor_ccds, cands=sorted(pool, key=rank_key)))
+        if not pool:
+            return f"; no candidates, site {idx} in candidates.tcl"
+        return f"; {len(pool)} candidate(s) in candidates.pdb, site {idx}"
 
     # cofactors without annotated residues that got no copy at all
     for ccd, groups in site_res.items():
@@ -1091,9 +1305,12 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
         why = (f"best copy did not fit: {why}" if why else
                "no transplanted copy" if not any(c["ccd"] == ccd for c in cands) else
                "no copy passed")
+        lbl = sorted(groups)[0]
+        chs = sorted({k[0] for c in cands + others if c["ccd"] == ccd for k in c["coverage"]})
+        note = "".join(candidates_note(ccd, ch, lbl, []) for ch in chs or chains[:1])
         (rep.review if ccd in cofactor_ccds else rep.info)(
             f"{ccd} is annotated in UniProt but without binding-site residues; none "
-            f"placed ({why})")
+            f"placed ({why}){note}")
 
     # annotated sites (per chain) that ended up without a ligand
     for ccd, groups in site_res.items():
@@ -1109,7 +1326,8 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
                 lb = f" site {label}" if label else ""
                 if sk in low_coord:          # always worth a look, cofactor or not
                     rep.review(f"{ccd} binding site{lb} in chain {ch} left empty "
-                               f"({low_coord[sk]})")
+                               f"({low_coord[sk]})"
+                               + candidates_note(ccd, ch, label, groups[label]))
                     continue
                 # site sharing residues with a filled one: one copy serves both
                 if covered.get(sk) in dropped:
@@ -1127,11 +1345,80 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
                        + ("; some were not transferred, see INFO" if fit_rmsd is not None
                           and getattr(cfg, "_transfer_drops", False) else ""))
                 lb = f" site {label}" if label else ""
-                msg = f"{ccd} binding site{lb} in chain {ch} left empty ({why})"
+                msg = (f"{ccd} binding site{lb} in chain {ch} left empty ({why})"
+                       + candidates_note(ccd, ch, label, groups[label]))
                 # an annotated cofactor missing is a problem; a substrate left out
                 # of an apo-like pocket is expected
                 (rep.review if ccd in cofactor_ccds else rep.info)(msg)
+    rep.data["candidate_sites"] = [
+        {"site": c["site"], "ligand": c["ccd"], "chain": c["chain"],
+         "label": "" if c["label"].startswith(NOSITE) else c["label"],
+         "residues": c["residues"],
+         "candidates": [{"rank": r, "copy": x["tag"], "why": x.get("why", "")}
+                        for r, x in enumerate(c["cands"], 1)]}
+        for c in rep.candidates]
     return kept
+
+
+def write_candidates(outdir, rep):
+    """candidates.pdb: copies considered for each empty site, in the model's
+    frame (B-factor = site number, occupancy = rank, 1 = best), described in
+    REMARK 250 lines, which also list empty sites without any candidate;
+    candidates.tcl shows them in VMD next to prepped.pdb and prints the remarks."""
+    if not rep.candidates:
+        return
+    uni = rep.data.get("uniprot") or {}
+    head = f"{rep.name} - UniProt {rep.data.get('accession') or '?'}"
+    if uni.get("protein_name"):
+        head += f" ({uni['protein_name']})"
+    lines, atoms_out, serial = [f"REMARK 250 {head}"], [], 0
+    for s in rep.candidates:
+        lab = f" site {s['label']}" if s["label"] and not s["label"].startswith(NOSITE) else ""
+        where = (f"residues {','.join(map(str, s['residues']))}" if s["residues"]
+                 else "no annotated residues")
+        lines.append(f"REMARK 250 SITE {s['site']}: {s['ccd']}{lab} in chain {s['chain']} "
+                     f"({where}){' - cofactor' if s['cofactor'] else ''}")
+        if not s["cands"]:
+            lines.append("REMARK 250   no candidate copies (nothing transplanted near the site)")
+        for rank, c in enumerate(s["cands"], 1):
+            cov = max(c["coverage"].values())
+            extra = (f", {len(c['donors'])} donors" if c["metal"] else "") + \
+                (f", moved {c['shift']:.1f} A" if c["shift"] >= 0.05 else "")
+            lines.append(f"REMARK 250   rank {rank}: {c['tag']} - {c.get('why', '')} "
+                         f"(clashes {c['clashes']}, burial {c['burial']:.0%}, "
+                         f"coverage {cov:.0%}{extra})")
+            for a in heavy(c["atoms"]) or c["atoms"]:
+                serial += 1
+                b = replace(a, record="HETATM", resname=s["ccd"], chain=s["chain"][:1],
+                            resnum=min(9999, s["site"] * 100 + rank), icode="",
+                            b=float(s["site"]))
+                line = pdb_line(b, serial, f"S{s['site']:03d}"[:4])
+                atoms_out.append(line[:54] + f"{rank:6.2f}" + line[60:])
+    (Path(outdir) / "candidates.pdb").write_text(
+        "\n".join(lines) + "\n" + "".join(atoms_out) + "END\n")
+    tcl = ["# load from this folder: vmd -e candidates.tcl",
+           "set fh [open candidates.pdb r]",
+           "while {[gets $fh line] >= 0} {",
+           "    if {[string match \"REMARK 250*\" $line]} {puts [string range $line 11 end]}",
+           "}",
+           "close $fh",
+           "mol new prepped.pdb", "mol modstyle 0 top NewCartoon",
+           "mol modselect 0 top protein"]
+    for s in rep.candidates:
+        if s["residues"]:
+            tcl += ["mol addrep top",
+                    "mol modstyle [expr [molinfo top get numreps]-1] top Licorice",
+                    "mol modcolor [expr [molinfo top get numreps]-1] top "
+                    + ("Name" if s["cands"] else "ColorID 1"),
+                    f"mol modselect [expr [molinfo top get numreps]-1] top \"protein and "
+                    f"chain {s['chain'][:1]} and resid {' '.join(map(str, s['residues']))}\"",
+                    f"# site {s['site']}: {s['ccd']}"
+                    + ("" if s["cands"] else " (no candidates; residues in red)")]
+    if atoms_out:
+        tcl += ["mol new candidates.pdb", "mol modstyle 0 top VDW 0.5",
+                "mol modcolor 0 top Beta",
+                "# B-factor = site number (REMARK 250 in candidates.pdb), occupancy = rank"]
+    (Path(outdir) / "candidates.tcl").write_text("\n".join(tcl) + "\n")
 
 
 # --------------------------------------------------------------------------
@@ -1344,7 +1631,6 @@ def run_dowser(protein, lig_atoms, outdir, cfg, rep):
                 log_txt, rc = r.stdout + r.stderr, r.returncode
             except subprocess.TimeoutExpired:
                 log_txt, rc = "TIMEOUT", -1
-            # log_txt, rc = (logdir / f"dowser_{label}.log").read_text(), -1 # debug
             (logdir / f"dowser_{label}.log").write_text(log_txt)
             mins = (time.time() - t0) / 60
             if "No buried cavities" in log_txt:
@@ -1726,11 +2012,11 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
     bd.mkdir(exist_ok=True)
     seg = lambda ch: f"PRO{ch}"
     tcl = [f'# psfgen build for "{name}" - generated by af_prep.py',
-           'package require psfgen', 'resetpsf']
-    toptcl = Path(cfg.toppar).resolve() / 'load_psfgen.tcl'
-    tcl += [f'source {{{toptcl}}}', f'load_charmm_topologies "{toptcl.parent}"']
-    tcl += ['pdbalias residue HIS HSE', 'pdbalias atom ILE CD1 CD',
-            'pdbalias residue HOH TIP3', 'pdbalias atom TIP3 O OH2', '']
+           "package require psfgen", "resetpsf"]
+    toptcl = Path(cfg.toppar).resolve() / "load_psfgen.tcl"
+    tcl += [f"source {{{toptcl}}}", f'load_charmm_topologies "{toptcl.parent}"']
+    tcl += ["pdbalias residue HIS HSE", "pdbalias atom ILE CD1 CD",
+            "pdbalias residue HOH TIP3", "pdbalias atom TIP3 O OH2", ""]
 
     by_chain = OrderedDict()
     for a in prot_heavy:
@@ -1749,16 +2035,16 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
             final.extend(ra)
         f = bd / f"protein_{ch}.pdb"
         write_pdb(final, f, seg(ch))
-        tcl += [f'segment {seg(ch)} {{', f'    first {fp}', f'    last {lp}',
-                f'    pdb "{f.name}"', '}', f'coordpdb "{f.name}" {seg(ch)}']
+        tcl += [f"segment {seg(ch)} {{", f"    first {fp}", f"    last {lp}",
+                f'    pdb "{f.name}"', "}", f'coordpdb "{f.name}" {seg(ch)}']
 
-    tcl += ['', '# protonation patches']
-    tcl += [f'patch {p} {seg(ch)}:{rn}' for p, ch, rn in patches]
-    tcl += ['', '# disulfides']
-    tcl += [f'patch DISU {seg(a[0])}:{a[1]} {seg(b[0])}:{b[1]}  ;# {d:.2f} A'
+    tcl += ["", "# protonation patches"]
+    tcl += [f"patch {p} {seg(ch)}:{rn}" for p, ch, rn in patches]
+    tcl += ["", "# disulfides"]
+    tcl += [f"patch DISU {seg(a[0])}:{a[1]} {seg(b[0])}:{b[1]}  ;# {d:.2f} A"
             for a, b, d in disulfides]
 
-    tcl += ['', '# cofactors']
+    tcl += ["", "# cofactors"]
     lig_seg = {}
     for k, lig in enumerate(ligands, 1):
         sid = f"HT{k:02d}"
@@ -1774,7 +2060,7 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
                   for a in heavy(lig["atoms"])]
             write_pdb(la, f, sid)
             auto = "    auto none\n" if len(la) == 1 else ""
-            tcl += [f'segment {sid} {{\n    first none\n    last none\n{auto}'
+            tcl += [f"segment {sid} {{\n    first none\n    last none\n{auto}"
                     f'    pdb "{f.name}"\n}}', f'coordpdb "{f.name}" {sid}']
             lig_seg[id(lig)] = (sid, la, amap)
             msg = f"{ccd} built as CHARMM residue {rname} (segment {sid})"
@@ -1800,8 +2086,8 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
 
     for his, lig in phem:
         if id(lig) in lig_seg:
-            tcl.append(f'patch PHEM {seg(his[0])}:{his[1]} {lig_seg[id(lig)][0]}:1'
-                       '  ;# VERIFY patch name/order in your heme toppar')
+            tcl.append(f"patch PHEM {seg(his[0])}:{his[1]} {lig_seg[id(lig)][0]}:1"
+                       "  ;# VERIFY patch name/order in your heme toppar")
 
     if waters:
         f = bd / "water_internal.pdb"
@@ -1809,26 +2095,26 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
                       resnum=i, icode="", element="O")
               for i, w in enumerate(waters, 1)]
         write_pdb(wa, f, "DWAT")
-        tcl += ['', '# Dowser++ internal waters',
-                'segment DWAT {\n    first none\n    last none\n    auto none\n'
-                f'    pdb "{f.name}"\n}}', f'coordpdb {f.name} DWAT']
+        tcl += ["", "# Dowser++ internal waters",
+                "segment DWAT {\n    first none\n    last none\n    auto none\n"
+                f'    pdb "{f.name}"\n}}', f'coordpdb "{f.name}" DWAT']
 
-    tcl += ['', 'regenerate angles dihedrals', 'guesscoord',
+    tcl += ["", "regenerate angles dihedrals", "guesscoord",
             f'writepsf "{name}.psf"', f'writepdb "{name}.pdb"']
     final = name
     if cfg.solvate:
-        tcl += ['', 'package require solvate',
+        tcl += ["", "package require solvate",
                 f'solvate "{name}.psf" "{name}.pdb" -t {cfg.padding} -o "{name}_solv"',
-                'package require autoionize',
+                "package require autoionize",
                 f'autoionize -psf "{name}_solv.psf" -pdb "{name}_solv.pdb" '
                 f'-sc {cfg.salt} -o "{name}_ion"']
-        final = f'{name}_ion'
-        tcl += ['', '# box dimensions for NAMD',
+        final = f"{name}_ion"
+        tcl += ["", "# box dimensions for NAMD",
                 f'set bm [mol new "{final}.psf"]', f'mol addfile "{final}.pdb" waitfor all',
-                'set mm [measure minmax [atomselect $bm all]]',
+                "set mm [measure minmax [atomselect $bm all]]",
                 f'set fh [open "{final}_box.txt" w]',
-                'puts $fh [vecsub [lindex $mm 1] [lindex $mm 0]]', 'close $fh',
-                'mol delete $bm']
+                "puts $fh [vecsub [lindex $mm 1] [lindex $mm 0]]", "close $fh",
+                "mol delete $bm"]
 
     eb = []
     for lig, m, p, d in extrabonds:
@@ -1838,15 +2124,15 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
         mname = amap.get(m.name, m.name)
         eb.append((sid, 1, mname, seg(p.chain), p.resnum, p.name, f"{d:.3f}"))
     if eb:
-        tcl += ['', '# NAMD extraBonds restraints for metal coordination',
+        tcl += ["", "# NAMD extraBonds restraints for metal coordination",
                 f'set m [mol new "{final}.psf"]', f'mol addfile "{final}.pdb" waitfor all',
-                'set fh [open metal_extrabonds.txt w]',
-                f'foreach {{s1 r1 n1 s2 r2 n2 r0}} {{{" ".join(" ".join(map(str, e)) for e in eb)}}} {{',
-                '    set a [atomselect $m \'segname $s1 and resid $r1 and name $n1\']',
-                '    set b [atomselect $m \'segname $s2 and resid $r2 and name $n2\']',
-                f'    puts $fh \'bond [$a get index] [$b get index] {cfg.metal_k} $r0\'',
-                '    $a delete; $b delete', '}', 'close $fh']
-    tcl += ['', 'puts "AFPREP_BUILD_OK"', 'exit']
+                "set fh [open metal_extrabonds.txt w]",
+                f"foreach {{s1 r1 n1 s2 r2 n2 r0}} {{{' '.join(' '.join(map(str, e)) for e in eb)}}} {{",
+                "    set a [atomselect $m \"segname $s1 and resid $r1 and name $n1\"]",
+                "    set b [atomselect $m \"segname $s2 and resid $r2 and name $n2\"]",
+                f"    puts $fh \"bond [$a get index] [$b get index] {cfg.metal_k} $r0\"",
+                "    $a delete; $b delete", "}", "close $fh"]
+    tcl += ["", 'puts "AFPREP_BUILD_OK"', "exit"]
     (bd / "build.tcl").write_text("\n".join(tcl) + "\n")
     return bd
 
@@ -1974,7 +2260,7 @@ def process(model, cfg):
         rep.review(n)
     rep.data["accession"] = acc
 
-   # --- input model and pLDDT
+    # --- input model and pLDDT
     inp = read_structure(model)
     plddt = {(a.chain, a.resnum): a.b for a in inp if a.name == "CA" and is_protein(a)}
 
@@ -2006,7 +2292,7 @@ def process(model, cfg):
     af_protein = [a for a in src if is_protein(a) and a.record == "ATOM"]
     ligs = OrderedDict((k, v) for k, v in group_residues(
         [a for a in src if not is_protein(a) and not is_water(a)]).items())
-    fit_rmsd = {}
+    fit_rmsd, rejected = {}, []
     protein = [a for a in inp if is_protein(a) and a.record == "ATOM"]
     if af_file:
         ca_in = {(a.chain, a.resnum): a.xyz for a in inp if a.name == "CA"}
@@ -2026,7 +2312,7 @@ def process(model, cfg):
             if not same_len or dev > 0.5:
                 rep.info(f"AlphaFill protein differs from input model (CA RMSD {dev:.2f} A, "
                          f"same length: {same_len}); ligands moved onto the input model")
-            ligs, fit_rmsd = transplant_ligands(ligs, af_protein, protein, cfg, rep)
+            ligs, fit_rmsd, rejected = transplant_ligands(ligs, af_protein, protein, cfg, rep)
 
     # --- 3. trim
     protein, termini = trim_protein(protein, plddt, uni, cfg, rep)
@@ -2045,7 +2331,8 @@ def process(model, cfg):
         for c in sorted(cofactor_ccds - set(site_res)):
             site_res[c] = {f"{NOSITE}{k}": set() for k in range(1, counts.get(c, 1) + 1)}
     ligands = (select_ligands(protein, ligs, allowed, site_res, unmapped, related,
-                              fit_rmsd, cofactor_ccds, cfg, rep) if ligs else [])
+                              fit_rmsd, cofactor_ccds, cfg, rep, rejected)
+               if ligs or rejected or site_res else [])
     for lig in ligands:                           # UniProt names of the site each one fills
         names = site_names.get(lig["ccd"], {})
         lig["uniprot"] = sorted(names.get(lig["site_label"], set())
@@ -2061,9 +2348,18 @@ def process(model, cfg):
             (rep.info if explained else rep.review)(msg)
     lig_atoms = [a for l in ligands for a in l["atoms"]]
     write_pdb(heavy(protein) + heavy(lig_atoms), outdir / "prepped.pdb")
+    write_candidates(outdir, rep)
 
     # --- 4. Dowser++ internal waters
     waters = run_dowser(protein, lig_atoms, outdir, cfg, rep) if cfg.dowser_dir else []
+
+    for lig in ligands:
+        if lig.get("water_completed") and cfg.dowser_dir:
+            el = lig["el"][0]
+            n = sum(1 for w in waters if np.linalg.norm(np.subtract(w.xyz, lig["xyz"][0]))
+                    <= metal_ideal(el, "O") + cfg.donor_tol)
+            rep.info(f"{lig['tag']}: {n} Dowser++ water(s) at bonding distance"
+                     + ("" if n else "; bulk water from solvation may still reach it"))
 
     # --- 5. PDB2PQR
     p2p_atoms, pkas, p2p_disu = run_pdb2pqr(protein, waters, ligands, outdir, cfg, rep)
@@ -2330,7 +2626,11 @@ def main(argv=None):
                         "donors; 0 disables")
     p.add_argument("--min-metal-donors", type=int, default=3,
                    help="metal ions with fewer protein donors are kept only if a kept "
-                        "ligand bridges them (e.g. Mg.ATP); otherwise dropped and flagged")
+                        "ligand bridges them (e.g. Mg.ATP) or, one donor short, if there is "
+                        "room for water to complete them (flagged); otherwise dropped")
+    p.add_argument("--denovo-shift", type=float, default=2.5,
+                   help="how far (A) a metal ion placed from the annotated residues' donor "
+                        "atoms may move from its starting point")
     p.add_argument("--metal-min-sep", type=float, default=3.0,
                    help="minimum distance between two metal ions kept in sharing sites (A)")
     p.add_argument("--metal-k", type=float, default=100.0,

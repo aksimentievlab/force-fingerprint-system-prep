@@ -285,14 +285,33 @@ Each report lists the mapping it used and how each code was found.
   The same distances define the extraBonds restraints.
   A metal ion held by fewer than 3 protein donors is usually completed by a substrate or nucleotide, as in Mg.ATP.
   It is kept only if a kept ligand bridges it (an O/N/S of that ligand within bonding distance of the ion);
-  otherwise it is dropped and its site flagged REVIEW, whether or not UniProt calls it a cofactor:
-  the ion may be substrate-bridged, or its site may be completed by waters that AlphaFill does not transplant.
+  An ion one donor short (2 by default) is kept if there is room for a water molecule at bonding distance,
+  since waters from solvation or Dowser++ can complete its coordination;
+  it is flagged REVIEW as a warning, and with Dowser++ the report says whether one of its waters reaches the ion.
+  Otherwise the ion is dropped and its site flagged REVIEW, whether or not UniProt calls it a cofactor:
+  the ion may be substrate-bridged.
+- **Metal sites without a usable copy.** An annotated metal site that is still empty (no copy, or every copy dropped)
+  gets an ion placed from the donor atoms of its annotated residues:
+  starting from the centroids of donor pairs and triples, the ion moves by up to 2.5 Å (`--denovo-shift`) to fit them,
+  and is kept under the same coordination rules (no partner ligand counts here).
+  This also works when AlphaFill has no file for the protein.
   The same tests apply to cofactors and to other annotated ligands (substrates, nucleotides);
   the only difference is the reporting: an annotated cofactor whose site stays empty is flagged REVIEW,
   any other ligand left out is noted as INFO.
 - **Cofactors without annotated residues.** UniProt sometimes names a cofactor without binding-site positions.
   Copies of such a cofactor are kept if they pass the clash and burial tests and, for metal ions, have at least 3 protein donors.
   The number of copies is taken from UniProt's cofactor note ("Binds 2 Mg(2+) ions per subunit"), otherwise one per chain.
+- **Candidates for empty sites.** When a binding site stays empty, or a cofactor without annotated residues cannot be placed,
+  the copies that were considered are written to `candidates.pdb` in the model's frame:
+  copies that failed the fit or coordination tests, copies rejected during transfer (placed with their local superposition),
+  and copies within 8 Å of the site that did not touch an annotated residue.
+  The B-factor column holds the site number and the occupancy column the rank within the site (1 = best);
+  REMARK 250 lines describe each site and list every candidate with its fit values and the reason it was not kept.
+  Empty sites without any candidate are listed too.
+  The site's REVIEW line gives its site number.
+  `candidates.tcl` prints the REMARK lines (headed by the model, UniProt accession and protein name),
+  loads `prepped.pdb` with the annotated residues shown (in red for sites without candidates)
+  and the candidates colored by site.
 - **Reporting.**
   - When a cofactor's missing site is already explained by a site-level line (site left empty, ion dropped, no copy fitting),
   the summary line "annotated cofactor ... not placed" is noted as INFO instead of repeating the REVIEW.
@@ -378,6 +397,8 @@ Each report lists the mapping it used and how each code was found.
 `-- <model>/
     |-- report.txt, report.json    what was done: REVIEW, then NEEDS_PARAMS, then INFO
     |-- prepped.pdb                trimmed protein + kept cofactors (heavy atoms)
+    |-- candidates.pdb             copies considered for sites left empty (see below)
+    |-- candidates.tcl             shows them in VMD: vmd -e candidates.tcl
     |-- dowser/                    Dowser++ logs and raw output
     |-- pdb2pqr/                   PDB2PQR input, output, PROPKA log
     `-- build/
@@ -457,7 +478,8 @@ Each report lists the mapping it used and how each code was found.
 | `--metal-cutoff` | 2.8 Å | metal-donor distance for extraBonds restraints and residue overrides |
 | `--donor-tol` | 0.35 Å | a protein atom counts as a metal donor up to the metal's typical bond length plus this |
 | `--metal-shift` | 1 Å | largest move when fitting a transplanted metal ion to its donors; 0 disables |
-| `--min-metal-donors` | 3 | metal ions with fewer protein donors are kept only if a kept ligand bridges them |
+| `--min-metal-donors` | 3 | metal ions with fewer protein donors are kept only if a kept ligand bridges them, or, one donor short, if there is room for water (flagged) |
+| `--denovo-shift` | 2.5 Å | how far an ion placed from the annotated residues' donor atoms may move from its starting point |
 | `--metal-min-sep` | 3 Å | minimum distance between two metal ions in sites that share residues |
 | `--metal-k` | 100 | extraBonds force constant (kcal/mol/Å^2) |
 | `--cys-deprot-patch` | `CYSD` | patch for metal-bound cysteines |
