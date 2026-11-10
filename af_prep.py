@@ -1459,15 +1459,25 @@ def write_candidates(outdir, rep):
     for s in rep.candidates:
         if s["residues"]:
             tcl += ["mol addrep top",
-                    "mol modstyle [expr [molinfo top get numreps]-1] top Licorice",
+                    "mol modstyle [expr [molinfo top get numreps]-1] top Licorice 0.3",
                     "mol modcolor [expr [molinfo top get numreps]-1] top "
                     + ("Name" if s["cands"] else "ColorID 1"),
                     f"mol modselect [expr [molinfo top get numreps]-1] top \"protein and "
                     f"chain {s['chain'][:1]} and resid {' '.join(map(str, s['residues']))}\"",
                     f"# site {s['site']}: {s['ccd']}"
                     + ("" if s["cands"] else " (no candidates; residues in red)")]
+            tcl += ["mol addrep top",
+                    "mol modstyle [expr [molinfo top get numreps]-1] top Licorice 0.1",
+                    "mol modcolor [expr [molinfo top get numreps]-1] top "
+                    + ("Name" if s["cands"] else "ColorID 1"),
+                    f"mol modselect [expr [molinfo top get numreps]-1] top \"within 5 of protein and "
+                    f"chain {s['chain'][:1]} and resid {' '.join(map(str, s['residues']))}\"",
+                    f"# site {s['site']}: {s['ccd']}"
+                    + ("" if s["cands"] else " (no candidates; residues in red)")]
+
     if atoms_out:
         tcl += ["mol new candidates.pdb", "mol modstyle 0 top VDW 0.5",
+                "mol modmaterial 0 top GlassBubble", 
                 "mol modcolor 0 top Beta",
                 "# B-factor = site number (REMARK 250 in candidates.pdb), occupancy = rank"]
     (Path(outdir) / "candidates.tcl").write_text("\n".join(tcl) + "\n")
