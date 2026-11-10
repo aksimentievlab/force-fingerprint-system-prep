@@ -272,6 +272,9 @@ Each report lists the mapping it used and how each code was found.
 
   An apo-like pocket, collapsed or opened up, fails these tests.
   At most one copy is kept per annotated site and chain.
+  Cofactors are selected first, so a substrate cannot take the place of the cofactor it needs.
+  Copies of different ligands may not overlap (atoms closer than 2 Å);
+  pairs involving a metal atom only count below 1.6 Å, since a metal bonds to ligand atoms at about 2 Å (e.g. O2 on the iron of a dioxygenase).
   Sites of the same ligand that share residues get a second copy only if both can coexist:
   for metal ions, at least 3 Å apart and each with protein donors of its own, as in binuclear sites;
   organic ligands never share.
@@ -285,11 +288,15 @@ Each report lists the mapping it used and how each code was found.
   The same distances define the extraBonds restraints.
   A metal ion held by fewer than 3 protein donors is usually completed by a substrate or nucleotide, as in Mg.ATP.
   It is kept only if a kept ligand bridges it (an O/N/S of that ligand within bonding distance of the ion);
+  such a partner must have at least 6 heavy atoms (`--min-partner-atoms`), so that small molecules that bind only to the metal,
+  such as O2, NO or acetate, do not count, and the ion then stays at its transplanted position, where it bonds to the partner.
   An ion one donor short (2 by default) is kept if there is room for a water molecule at bonding distance,
   since waters from solvation or Dowser++ can complete its coordination;
   it is flagged REVIEW as a warning, and with Dowser++ the report says whether one of its waters reaches the ion.
   Otherwise the ion is dropped and its site flagged REVIEW, whether or not UniProt calls it a cofactor:
   the ion may be substrate-bridged.
+  Conversely, a non-cofactor ligand that coordinates the position of a metal ion that was not placed is dropped too,
+  since it would bind only with the metal there.
 - **Metal sites without a usable copy.** An annotated metal site that is still empty (no copy, or every copy dropped)
   gets an ion placed from the donor atoms of its annotated residues:
   starting from the centroids of donor pairs and triples, the ion moves by up to 2.5 Å (`--denovo-shift`) to fit them,
@@ -478,6 +485,7 @@ Each report lists the mapping it used and how each code was found.
 | `--metal-cutoff` | 2.8 Å | metal-donor distance for extraBonds restraints and residue overrides |
 | `--donor-tol` | 0.35 Å | a protein atom counts as a metal donor up to the metal's typical bond length plus this |
 | `--metal-shift` | 1 Å | largest move when fitting a transplanted metal ion to its donors; 0 disables |
+| `--min-partner-atoms` | 6 | heavy atoms a ligand needs to count as the partner holding a poorly coordinated metal ion |
 | `--min-metal-donors` | 3 | metal ions with fewer protein donors are kept only if a kept ligand bridges them, or, one donor short, if there is room for water (flagged) |
 | `--denovo-shift` | 2.5 Å | how far an ion placed from the annotated residues' donor atoms may move from its starting point |
 | `--metal-min-sep` | 3 Å | minimum distance between two metal ions in sites that share residues |

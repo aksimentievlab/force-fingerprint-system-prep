@@ -991,8 +991,9 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
             continue
         la = heavy(atoms) or atoms
         metal = len(la) == 1 and la[0].element in METAL_ELEMENTS
-        shift, donors = 0.0, set()
+        shift, donors, xyz0 = 0.0, set(), None
         if metal:
+            xyz0 = np.array(la[0].xyz)          # transplanted position (partner geometry)
             p, shift, donors = refine_metal(la[0].xyz, la[0].element, ph, tree, cfg)
             la = [replace(la[0], x=float(p[0]), y=float(p[1]), z=float(p[2]))]
             atoms = la
@@ -1034,7 +1035,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
         cands.append(dict(key=key, ccd=ccd, atoms=atoms, xyz=xyz, metal=metal,
                           el=[a.element for a in la], shift=shift, nosite=nosite,
                           clashes=clashes, burial=burial, coverage=coverage, tag=tag,
-                          donors=donors, cofactor=ccd in cofactor_ccds,
+                          donors=donors, cofactor=ccd in cofactor_ccds, xyz0=xyz0,
                           water=metal and water_space(xyz[0], la[0].element, tree)))
     # copies rejected during transfer: not selectable, but listed as candidates
     # for empty sites (placed with their fit, metal positions refined)
@@ -1112,14 +1113,25 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
             f.append(f"only {n} protein donor(s)")
         return f
 
-    # best-fitting copies first
-    cands.sort(key=lambda c: (bool(failures(c, max(c["coverage"].values()))),
+    # cofactors first (a substrate must not take the place of the cofactor it
+    # needs), then best-fitting copies
+    cands.sort(key=lambda c: (not c["cofactor"],
+                              bool(failures(c, max(c["coverage"].values()))),
                               -max(c["coverage"].values()), c["clashes"]))
     # annotated sites of the same ligand that share residues: alternative or
     # adjacent positions; a second copy is only allowed where both can coexist
     def overlapping(ccd, l1, l2):
         g = site_res[ccd]
         return l1 != l2 and bool(g[l1] & g[l2])
+
+    def overlaps(c, k):
+        """Do copies c and k occupy the same space?  A metal atom bonds to ligand
+        O/N/S at ~2 A, so pairs involving a metal only count below --metal-clash."""
+        D = np.linalg.norm(c["xyz"][:, None] - k["xyz"][None], axis=2)
+        mc = np.array([e in METAL_ELEMENTS for e in c["el"]])
+        mk = np.array([e in METAL_ELEMENTS for e in k["el"]])
+        thr = np.where(mc[:, None] | mk[None, :], cfg.metal_clash, cfg.overlap)
+        return bool(np.any(D < thr))
 
     def coexists(c, k):
         """Can copy c sit next to kept copy k of the same ligand?"""
@@ -1155,8 +1167,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
             rep.info(f"dropped {c['tag']} (does not fit the model's pocket: "
                      f"{', '.join(fail)})")
             continue
-        if any(np.min(np.linalg.norm(c["xyz"][:, None] - k["xyz"][None], axis=2))
-               < cfg.overlap for k in kept):
+        if any(overlaps(c, k) for k in kept):
             c["why"] = "overlaps a kept ligand"
             rep.info(f"dropped {c['tag']} (overlaps a kept ligand)")
             continue
@@ -1193,11 +1204,29 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
     low_coord, dropped, warn = {}, set(), []
     for c in [k for k in kept if k["metal"] and len(k["donors"]) < cfg.min_metal_donors]:
         m_el = c["el"][0]
-        partners = [k["tag"] for k in kept if not k["metal"] and any(
-            el in ("O", "N", "S") and np.linalg.norm(p - c["xyz"][0])
-            <= metal_ideal(m_el, el) + cfg.donor_tol
-            for el, p in zip(k["el"], k["xyz"]))]
+        # partners must be able to anchor the ion themselves (e.g. ATP), not small
+        # molecules that bind only to the metal (O2, NO, CO, acetate ...)
+        def partners_at(pos):
+            return [k["tag"] for k in kept if not k["metal"]
+                    and len(k["el"]) >= cfg.min_partner_atoms and any(
+                        el in ("O", "N", "S") and np.linalg.norm(p - pos)
+                        <= metal_ideal(m_el, el) + cfg.donor_tol
+                        for el, p in zip(k["el"], k["xyz"]))]
+        partners = partners_at(c["xyz"][0])
         n = len(c["donors"])
+        if not partners and c.get("xyz0") is not None and c["shift"] > 0:
+            # the refinement only sees protein donors and may have pulled the ion
+            # away from its partner: keep it where it was transplanted, with it
+            partners = partners_at(c["xyz0"])
+            if partners:
+                p0 = c["xyz0"]
+                c["atoms"] = [replace(c["atoms"][0], x=float(p0[0]), y=float(p0[1]),
+                                      z=float(p0[2]))]
+                c["xyz"] = coords(c["atoms"])
+                c["kept_msg"] = c["kept_msg"].replace(
+                    f", moved {c['shift']:.1f} A to fit its donors", "")
+                c["shift"] = 0.0
+                c["kept_msg"] += "; kept at its transplanted position"
         if partners:
             c["kept_msg"] += f"; bridged by {', '.join(partners)}"
             continue
@@ -1245,7 +1274,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
                     continue
                 if any(k["metal"] and np.linalg.norm(p - k["xyz"][0]) < cfg.metal_min_sep
                        for k in kept) or any(
-                        np.min(np.linalg.norm(k["xyz"] - p, axis=1)) < cfg.overlap
+                        np.min(np.linalg.norm(k["xyz"] - p, axis=1)) < cfg.metal_clash
                         for k in kept):
                     continue
                 k_new = sum(1 for k in kept if k["key"][0] == "new") + 1
@@ -1269,6 +1298,29 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
                 kept.append(c)
                 filled.add((ccd, ch, label))
                 low_coord.pop((ccd, ch, label), None)
+    # A non-cofactor ligand coordinating the position of a metal ion that was
+    # not placed (e.g. O2 on the iron of a dioxygenase) would bind only with the
+    # metal: drop it as well.
+    kept_metals = [k for k in kept if k["metal"]]
+    missing = [m for m in cands + others if m["metal"] and id(m) not in
+               {id(k) for k in kept_metals}]
+    for c in [k for k in kept if not k["metal"] and not k["cofactor"]]:
+        for el, p in zip(c["el"], c["xyz"]):
+            if el not in ("O", "N", "S"):
+                continue
+            near = [m for m in missing if np.linalg.norm(p - m["xyz"][0])
+                    <= metal_ideal(m["el"][0], el) + cfg.donor_tol]
+            if not near or any(np.linalg.norm(p - k["xyz"][0]) <=
+                               metal_ideal(k["el"][0], el) + cfg.donor_tol
+                               for k in kept_metals):
+                continue
+            kept.remove(c)
+            filled.discard((c["ccd"],) + c["site"])
+            c["why"] = f"coordinates the position of {near[0]['tag']}, which was not placed"
+            for k in c["coverage"]:
+                best_reject.setdefault((c["ccd"],) + k, c["why"])
+            rep.info(f"dropped {c['tag']} ({c['why']}; it would bind only with the metal)")
+            break
     for c in kept:
         rep.info(c["kept_msg"])
     for w in warn:
@@ -2628,6 +2680,9 @@ def main(argv=None):
                    help="metal ions with fewer protein donors are kept only if a kept "
                         "ligand bridges them (e.g. Mg.ATP) or, one donor short, if there is "
                         "room for water to complete them (flagged); otherwise dropped")
+    p.add_argument("--min-partner-atoms", type=int, default=6,
+                   help="heavy atoms a ligand needs to count as the partner that holds a "
+                        "poorly coordinated metal ion (excludes O2, NO, CO, acetate ...)")
     p.add_argument("--denovo-shift", type=float, default=2.5,
                    help="how far (A) a metal ion placed from the annotated residues' donor "
                         "atoms may move from its starting point")
