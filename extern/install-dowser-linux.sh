@@ -17,7 +17,7 @@ tar -xzf dowserplusplus.tar.gz
 (
     cd dowserplusplus/files
     cp -f ../../mgltools_x86_64Linux2_1.5.7/bin/pythonsh .
-    chmod a+x run load_data reform drain sorting internal_predicted placeWat choosing main.sh pdbqt conf make_config
+    chmod a+x run load_data reform drain sorting internal_predicted placeWat choosing main.sh pdbqt conf make_config pythonsh
 
     cat > select_boxes.py <<"EOF"
 #!/usr/bin/env python3
