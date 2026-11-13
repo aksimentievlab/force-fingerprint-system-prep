@@ -929,13 +929,67 @@ def place_metal_from_site(metal, ch, residues, atoms, tree, cfg):
         p, _, d = refine_metal(p0, metal, atoms, tree, wide)
         if tree.query(p)[0] < cfg.metal_clash:
             continue
+        # at least two donors must come from the annotated residues themselves
+        if len({atoms[i].resnum for i in d if i in X}) < 2:
+            continue
         if len(d) > len(best_don):
             best, best_don = p, d
     return best, best_don
 
 
+def unify_alternative_codes(uni, mapping, site_res, cofactor_ccds):
+    """UniProt ligands often map to several PDB codes (Fe(2+): FE2/FE, NAD(+):
+    NAD/NAI).  A copy under any of them fills the ligand's site, so all codes of
+    a group get the same sites and one representative code identifies them.
+    Groups without annotated residues but named as cofactor get pseudo-sites,
+    one per copy UniProt's note gives ("Binds 2 Mg(2+) ions per subunit").
+    Changes site_res in place; returns {code: representative code}."""
+    parent = {}
+
+    def find(x):
+        while parent[x] != x:
+            x = parent[x]
+        return x
+
+    counts = {}
+    names = list(dict.fromkeys(uni["cofactors"] + [x["ligand"] for x in uni["sites"]]))
+    for name in names:
+        codes = mapping.get(name, {}).get("codes", [])
+        first = {}        # per kind of molecule: metals by element, the rest together
+        for c in codes:
+            parent.setdefault(c, c)
+            # a generic name ("a divalent metal cation": MG, MN, ZN ...) must not
+            # merge different metals into one site: only the same element groups
+            kind = metal_element(c) or "*"
+            parent[find(c)] = find(first.setdefault(kind, c))
+            counts[c] = max(counts.get(c, 1), uni["cofactor_counts"].get(name, 1))
+    groups = {}
+    for c in parent:                               # insertion order: cofactors first
+        groups.setdefault(find(c), []).append(c)
+    canon = {}
+    for members in groups.values():
+        with_sites = [c for c in members if c in site_res]
+        if with_sites:
+            merged = {}
+            for c in with_sites:
+                for lb, res in site_res[c].items():
+                    merged.setdefault(lb, set()).update(res)
+            for c in members:
+                site_res[c] = {lb: set(res) for lb, res in merged.items()}
+            head = with_sites[0]
+        else:
+            head = members[0]
+            if any(c in cofactor_ccds for c in members):
+                n = max(counts.get(c, 1) for c in members)
+                for c in members:
+                    site_res[c] = {f"{NOSITE}{k}": set() for k in range(1, n + 1)}
+        for c in members:
+            canon[c] = head
+    return canon
+
+
 def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_rmsd,
-                   cofactor_ccds, cfg, rep, rejected=()):
+                   cofactor_ccds, cfg, rep, rejected=(), canon=None):
     """Keep ligands that sit in a UniProt-annotated binding site for that ligand
     and fit the model's pocket (no clashes, buried, covering the site), at most
     one copy per site and chain."""
@@ -946,6 +1000,15 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
     chain_res = {}
     for a in ph:
         chain_res.setdefault(a.chain, set()).add(a.resnum)
+    canon = canon or {}
+
+    def G(ccd):
+        """Representative code of the UniProt ligand this code belongs to."""
+        return canon.get(ccd, ccd)
+
+    def group_name(ccd):
+        return "/".join([ccd] + sorted(c for c, h in canon.items() if h == ccd and c != ccd))
+
     cands, no_sites = [], set()
     not_in_uniprot, unmapped_hits = Counter(), {}
     related_hits = Counter()      # (name, code, kind): loose matches in mapped sites
@@ -1122,7 +1185,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
     # adjacent positions; a second copy is only allowed where both can coexist
     def overlapping(ccd, l1, l2):
         g = site_res[ccd]
-        return l1 != l2 and bool(g[l1] & g[l2])
+        return l1 != l2 and l1 in g and l2 in g and bool(g[l1] & g[l2])
 
     def overlaps(c, k):
         """Do copies c and k occupy the same space?  A metal atom bonds to ligand
@@ -1148,7 +1211,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
 
     kept, filled, best_reject, covered = [], set(), {}, {}
     for c in cands:
-        open_sites = [k for k in c["coverage"] if (c["ccd"],) + k not in filled]
+        open_sites = [k for k in c["coverage"] if (G(c["ccd"]),) + k not in filled]
         if not open_sites:
             c["why"] = "site already has a better-placed copy"
             rep.info(f"dropped {c['tag']} (site already has a better-placed copy)")
@@ -1157,13 +1220,14 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
         # (so e.g. two ions of a binuclear site each get their own site)
         later = cands[cands.index(c) + 1:]
         site = max(open_sites, key=lambda k: (
-            c["coverage"][k], -sum(k in o["coverage"] for o in later if o["ccd"] == c["ccd"])))
+            c["coverage"][k], -sum(k in o["coverage"] for o in later
+                                     if G(o["ccd"]) == G(c["ccd"]))))
         cov = c["coverage"][site]
         fail = failures(c, cov)
         if fail:
             c["why"] = "does not fit: " + ", ".join(fail)
             for k in c["coverage"]:
-                best_reject.setdefault((c["ccd"],) + k, ", ".join(fail))
+                best_reject.setdefault((G(c["ccd"]),) + k, ", ".join(fail))
             rep.info(f"dropped {c['tag']} (does not fit the model's pocket: "
                      f"{', '.join(fail)})")
             continue
@@ -1172,7 +1236,8 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
             rep.info(f"dropped {c['tag']} (overlaps a kept ligand)")
             continue
         # same ligand already placed in an overlapping site of this chain?
-        clash_with = [k for k in kept if k["ccd"] == c["ccd"] and k["site"][0] == site[0]
+        clash_with = [k for k in kept if G(k["ccd"]) == G(c["ccd"])
+                      and k["site"][0] == site[0]
                       and overlapping(c["ccd"], k["site"][1], site[1])]
         if c["metal"]:   # metal ions too close to coexist, whatever the labels
             clash_with += [k for k in kept if k["metal"] and k not in clash_with and
@@ -1181,10 +1246,10 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
         if any(not ok for ok, _ in verdicts):
             why = next(w for ok, w in verdicts if not ok)
             c["why"] = why
-            covered.setdefault((c["ccd"],) + site, clash_with[0]["tag"])
+            covered.setdefault((G(c["ccd"]),) + site, clash_with[0]["tag"])
             rep.info(f"dropped {c['tag']} ({why})")
             continue
-        filled.add((c["ccd"],) + site)
+        filled.add((G(c["ccd"]),) + site)
         c["site"] = site
         c["site_label"] = site[1]
         kept.append(c)
@@ -1238,23 +1303,16 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
         kept.remove(c)
         dropped.add(c["tag"])
         c["why"] = f"only {n} protein donor(s), no partner ligand kept"
-        filled.discard((c["ccd"],) + c["site"])
-        low_coord[(c["ccd"],) + c["site"]] = (
+        filled.discard((G(c["ccd"]),) + c["site"])
+        low_coord[(G(c["ccd"]),) + c["site"]] = (
             f"{c['tag']} dropped: only {n} protein donor(s) within bonding distance "
             "and no partner ligand kept (substrate-bridged ion, or a site completed "
             "by waters?)")
-    for c in kept:
-        if c["nosite"] and c["metal"] and len(c["donors"]) < cfg.min_metal_donors \
-                and not c.get("water_completed"):
-            c["water_completed"] = True
-            warn.append(f"{c['tag']} kept with only {len(c['donors'])} protein donors: room "
-                        "for water at bonding distance to complete its coordination - check")
-
     # Metal sites still empty: place the ion from the annotated residues' donor
     # atoms when no transplanted copy could be used.
     for ccd, groups in site_res.items():
         metal = metal_element(ccd)
-        if not metal:
+        if not metal or G(ccd) != ccd:
             continue
         for label, residues in groups.items():
             if label.startswith(NOSITE):
@@ -1262,7 +1320,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
             for ch in chains:
                 if (ccd, ch, label) in filled or not residues & chain_res.get(ch, set()):
                     continue
-                if any(k["ccd"] == ccd and k["site"][0] == ch and
+                if any(G(k["ccd"]) == ccd and k["site"][0] == ch and
                        overlapping(ccd, k["site"][1], label) for k in kept):
                     continue
                 p, don = place_metal_from_site(metal, ch, residues, ph, tree, cfg)
@@ -1304,7 +1362,8 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
     kept_metals = [k for k in kept if k["metal"]]
     missing = [m for m in cands + others if m["metal"] and id(m) not in
                {id(k) for k in kept_metals}]
-    for c in [k for k in kept if not k["metal"] and not k["cofactor"]]:
+    for c in [k for k in kept if not k["metal"] and not k["cofactor"]
+              and len(k["el"]) < cfg.min_partner_atoms]:   # larger ligands bind without it
         for el, p in zip(c["el"], c["xyz"]):
             if el not in ("O", "N", "S"):
                 continue
@@ -1315,10 +1374,10 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
                                for k in kept_metals):
                 continue
             kept.remove(c)
-            filled.discard((c["ccd"],) + c["site"])
+            filled.discard((G(c["ccd"]),) + c["site"])
             c["why"] = f"coordinates the position of {near[0]['tag']}, which was not placed"
             for k in c["coverage"]:
-                best_reject.setdefault((c["ccd"],) + k, c["why"])
+                best_reject.setdefault((G(c["ccd"]),) + k, c["why"])
             rep.info(f"dropped {c['tag']} ({c['why']}; it would bind only with the metal)")
             break
     for c in kept:
@@ -1336,7 +1395,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
                 c["clashes"], -cov, -c["burial"])
 
     def candidates_note(ccd, ch, label, residues):
-        pool = [c for c in cands + others if c["ccd"] == ccd and id(c) not in kept_ids
+        pool = [c for c in cands + others if G(c["ccd"]) == ccd and id(c) not in kept_ids
                 and (ch, label) in c["coverage"]]
         idx = len(rep.candidates) + 1
         rep.candidates.append(dict(
@@ -1348,26 +1407,30 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
 
     # cofactors without annotated residues that got no copy at all
     for ccd, groups in site_res.items():
-        if not all(lb.startswith(NOSITE) for lb in groups):
+        if G(ccd) != ccd or not all(lb.startswith(NOSITE) for lb in groups):
             continue
-        if any(k["ccd"] == ccd for k in kept):
+        if any(G(k["ccd"]) == ccd for k in kept):
             continue
         why = next((w for k, w in best_reject.items() if k[0] == ccd), None) or \
             next((w for k, w in low_coord.items() if k[0] == ccd), None)
         why = (f"best copy did not fit: {why}" if why else
-               "no transplanted copy" if not any(c["ccd"] == ccd for c in cands) else
+               "no transplanted copy" if not any(G(c["ccd"]) == ccd for c in cands) else
                "no copy passed")
         lbl = sorted(groups)[0]
-        chs = sorted({k[0] for c in cands + others if c["ccd"] == ccd for k in c["coverage"]})
+        chs = sorted({k[0] for c in cands + others if G(c["ccd"]) == ccd
+                      for k in c["coverage"]})
         note = "".join(candidates_note(ccd, ch, lbl, []) for ch in chs or chains[:1])
         (rep.review if ccd in cofactor_ccds else rep.info)(
-            f"{ccd} is annotated in UniProt but without binding-site residues; none "
-            f"placed ({why}){note}")
+            f"{group_name(ccd)} is annotated in UniProt but without binding-site "
+            f"residues; none placed ({why}){note}")
 
     # annotated sites (per chain) that ended up without a ligand
     for ccd, groups in site_res.items():
-        if ccd not in {c["ccd"] for c in cands} and ccd not in {k[3] for k in ligands}:
+        if G(ccd) != ccd:
+            continue                          # reported under its representative code
+        if ccd not in {G(c["ccd"]) for c in cands} and ccd not in {G(k[3]) for k in ligands}:
             continue  # nothing of this type was transplanted; reported elsewhere
+        gname = group_name(ccd)
         for label in groups:
             for ch in chains:
                 if not groups[label] & chain_res.get(ch, set()):
@@ -1377,7 +1440,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
                     continue
                 lb = f" site {label}" if label else ""
                 if sk in low_coord:          # always worth a look, cofactor or not
-                    rep.review(f"{ccd} binding site{lb} in chain {ch} left empty "
+                    rep.review(f"{gname} binding site{lb} in chain {ch} left empty "
                                f"({low_coord[sk]})"
                                + candidates_note(ccd, ch, label, groups[label]))
                     continue
@@ -1385,11 +1448,11 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
                 if covered.get(sk) in dropped:
                     covered.pop(sk)
                 by = covered.get(sk) or next(
-                    (k["tag"] for k in kept if k["ccd"] == ccd and k["site"][0] == ch
+                    (k["tag"] for k in kept if G(k["ccd"]) == ccd and k["site"][0] == ch
                      and overlapping(ccd, k["site"][1], label)), None)
                 if by:
                     lb = f" site {label}" if label else ""
-                    rep.info(f"{ccd} binding site{lb} in chain {ch} shares residues with "
+                    rep.info(f"{gname} binding site{lb} in chain {ch} shares residues with "
                              f"a site filled by {by}; one copy placed")
                     continue
                 why = (f"best copy did not fit: {best_reject[sk]}"
@@ -1397,7 +1460,7 @@ def select_ligands(protein, ligands, allowed, site_res, unmapped, related, fit_r
                        + ("; some were not transferred, see INFO" if fit_rmsd is not None
                           and getattr(cfg, "_transfer_drops", False) else ""))
                 lb = f" site {label}" if label else ""
-                msg = (f"{ccd} binding site{lb} in chain {ch} left empty ({why})"
+                msg = (f"{gname} binding site{lb} in chain {ch} left empty ({why})"
                        + candidates_note(ccd, ch, label, groups[label]))
                 # an annotated cofactor missing is a problem; a substrate left out
                 # of an apo-like pocket is expected
@@ -1417,6 +1480,8 @@ def write_candidates(outdir, rep):
     frame (B-factor = site number, occupancy = rank, 1 = best), described in
     REMARK 250 lines, which also list empty sites without any candidate;
     candidates.tcl shows them in VMD next to prepped.pdb and prints the remarks."""
+    for f in ("candidates.pdb", "candidates.tcl"):      # never leave an old run's files
+        (Path(outdir) / f).unlink(missing_ok=True)
     if not rep.candidates:
         return
     uni = rep.data.get("uniprot") or {}
@@ -1459,25 +1524,15 @@ def write_candidates(outdir, rep):
     for s in rep.candidates:
         if s["residues"]:
             tcl += ["mol addrep top",
-                    "mol modstyle [expr [molinfo top get numreps]-1] top Licorice 0.3",
+                    "mol modstyle [expr [molinfo top get numreps]-1] top Licorice",
                     "mol modcolor [expr [molinfo top get numreps]-1] top "
                     + ("Name" if s["cands"] else "ColorID 1"),
                     f"mol modselect [expr [molinfo top get numreps]-1] top \"protein and "
                     f"chain {s['chain'][:1]} and resid {' '.join(map(str, s['residues']))}\"",
                     f"# site {s['site']}: {s['ccd']}"
                     + ("" if s["cands"] else " (no candidates; residues in red)")]
-            tcl += ["mol addrep top",
-                    "mol modstyle [expr [molinfo top get numreps]-1] top Licorice 0.1",
-                    "mol modcolor [expr [molinfo top get numreps]-1] top "
-                    + ("Name" if s["cands"] else "ColorID 1"),
-                    f"mol modselect [expr [molinfo top get numreps]-1] top \"within 5 of protein and "
-                    f"chain {s['chain'][:1]} and resid {' '.join(map(str, s['residues']))}\"",
-                    f"# site {s['site']}: {s['ccd']}"
-                    + ("" if s["cands"] else " (no candidates; residues in red)")]
-
     if atoms_out:
         tcl += ["mol new candidates.pdb", "mol modstyle 0 top VDW 0.5",
-                "mol modmaterial 0 top GlassBubble", 
                 "mol modcolor 0 top Beta",
                 "# B-factor = site number (REMARK 250 in candidates.pdb), occupancy = rank"]
     (Path(outdir) / "candidates.tcl").write_text("\n".join(tcl) + "\n")
@@ -2068,10 +2123,22 @@ def tcl_list(items):
     return " ".join("{" + " ".join(str(x) for x in it) + "}" for it in items)
 
 
+def clean_build(bd, name):
+    """Remove what an earlier run generated in the build folder: an old PSF would
+    make a failed build look successful, old ligand files would suggest ligands
+    that are gone."""
+    for pat in ("protein_*.pdb", "lig_*.pdb", "water_internal.pdb", "build.tcl", "vmd.log",
+                "metal_extrabonds.txt", f"{name}.psf", f"{name}.pdb", f"{name}_solv.*",
+                f"{name}_ion.*", f"{name}_ion_box.txt"):
+        for f in Path(bd).glob(pat):
+            f.unlink()
+
+
 def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches,
                 disulfides, ligands, waters, phem, extrabonds, cfg, rep):
     bd = Path(outdir) / "build"
     bd.mkdir(exist_ok=True)
+    clean_build(bd, name)
     seg = lambda ch: f"PRO{ch}"
     tcl = [f'# psfgen build for "{name}" - generated by af_prep.py',
            "package require psfgen", "resetpsf"]
@@ -2184,7 +2251,11 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
             continue
         sid, la, amap = lig_seg[id(lig)]
         mname = amap.get(m.name, m.name)
-        eb.append((sid, 1, mname, seg(p.chain), p.resnum, p.name, f"{d:.3f}"))
+        pname = p.name
+        _, lp, _, n1 = termini[p.chain]
+        if p.resnum == n1:         # as renamed by normalize_cterm for the build
+            pname = ({"O": "OT1", "OXT": "OT2"} if lp == "CTER" else {"OT1": "O"}).get(pname, pname)
+        eb.append((sid, 1, mname, seg(p.chain), p.resnum, pname, f"{d:.3f}"))
     if eb:
         tcl += ["", "# NAMD extraBonds restraints for metal coordination",
                 f'set m [mol new "{final}.psf"]', f'mol addfile "{final}.pdb" waitfor all',
@@ -2192,7 +2263,12 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
                 f"foreach {{s1 r1 n1 s2 r2 n2 r0}} {{{' '.join(' '.join(map(str, e)) for e in eb)}}} {{",
                 "    set a [atomselect $m \"segname $s1 and resid $r1 and name $n1\"]",
                 "    set b [atomselect $m \"segname $s2 and resid $r2 and name $n2\"]",
-                f"    puts $fh \"bond [$a get index] [$b get index] {cfg.metal_k} $r0\"",
+                "    if {[$a num] == 1 && [$b num] == 1} {",
+                f"        puts $fh \"bond [$a get index] [$b get index] {cfg.metal_k} $r0\"",
+                "    } else {",
+                "        puts \"AFPREP_WARNING: no extraBonds restraint for $s1:$r1:$n1 - "
+                "$s2:$r2:$n2 (atom not found)\"",
+                "    }",
                 "    $a delete; $b delete", "}", "close $fh"]
     tcl += ["", 'puts "AFPREP_BUILD_OK"', "exit"]
     (bd / "build.tcl").write_text("\n".join(tcl) + "\n")
@@ -2202,6 +2278,11 @@ def build_files(name, outdir, prot_heavy, orig_resname, termini, states, patches
 # --------------------------------------------------------------------------
 # Driver
 # --------------------------------------------------------------------------
+
+def model_name(model):
+    """Name of a model's output folder and files: its file stem, sanitised."""
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", Path(model).stem)
+
 
 def model_accession(model, cfg):
     """(accession, AlphaFold id, review notes) from header, file name or --accession."""
@@ -2310,7 +2391,7 @@ def resolve_chebi_ids(cfg):
 
 def process(model, cfg):
     model = Path(model)
-    name = re.sub(r"[^A-Za-z0-9_.-]", "_", model.stem)
+    name = model_name(model)
     outdir = Path(cfg.outdir) / name
     outdir.mkdir(parents=True, exist_ok=True)
     rep = Report(name)
@@ -2382,18 +2463,12 @@ def process(model, cfg):
                                           else a.resname) for a in protein}
 
     cofactor_ccds = {c for ccds in expected for c in ccds}
-    # cofactors UniProt names without binding-site residues: pseudo-sites, one per
-    # copy UniProt's note gives ("Binds 2 Mg(2+) ions per subunit"), else one
-    if uni:
-        counts = {}
-        for co_name in uni["cofactors"]:
-            m = rep.data.get("ligand_mapping", {}).get(co_name, {})
-            for c in m.get("codes", []):
-                counts[c] = max(counts.get(c, 1), uni["cofactor_counts"].get(co_name, 1))
-        for c in sorted(cofactor_ccds - set(site_res)):
-            site_res[c] = {f"{NOSITE}{k}": set() for k in range(1, counts.get(c, 1) + 1)}
+    # alternative codes of one UniProt ligand share its sites; cofactors named
+    # without binding-site residues get pseudo-sites
+    canon = (unify_alternative_codes(uni, rep.data.get("ligand_mapping", {}), site_res,
+                                     cofactor_ccds) if uni else {})
     ligands = (select_ligands(protein, ligs, allowed, site_res, unmapped, related,
-                              fit_rmsd, cofactor_ccds, cfg, rep, rejected)
+                              fit_rmsd, cofactor_ccds, cfg, rep, rejected, canon)
                if ligs or rejected or site_res else [])
     for lig in ligands:                           # UniProt names of the site each one fills
         names = site_names.get(lig["ccd"], {})
@@ -2405,7 +2480,7 @@ def process(model, cfg):
             msg = (f"annotated cofactor {'/'.join(ccds)} not placed - "
                    "consider co-folding (Boltz/Chai-1) or a homolog structure")
             # a site-level line already says what happened: keep this one as INFO
-            explained = any(lvl == "REVIEW" and any(m.startswith(f"{c} ") for c in ccds)
+            explained = any(lvl == "REVIEW" and set(m.split(" ", 1)[0].split("/")) & set(ccds)
                             for lvl, m in rep.flags)
             (rep.info if explained else rep.review)(msg)
     lig_atoms = [a for l in ligands for a in l["atoms"]]
@@ -2442,32 +2517,45 @@ def process(model, cfg):
         key = (p.chain, p.resnum)
         rname = orig_resname[key]
         metal_bound.add(key)
+        # the side-chain atom decides: a backbone O of the same residue may
+        # coordinate too, without any consequence for its protonation
+        ring_n = rname == "HIS" and p.name in ("ND1", "NE2")
         if lig["ccd"] in ("HEM", "HEC"):
-            if rname == "HIS" and p.name == "NE2":
+            if ring_n and p.name == "NE2":
                 phem.append((key, lig))
-            if rname == "HIS":
-                his_coord.setdefault(key, set()).add(p.name)
+            if ring_n:
+                his_coord.setdefault(key, {}).setdefault(p.name, []).append((d, id(m)))
             continue
         extrabonds.append((lig, m, p, d))
-        if rname == "HIS":
-            his_coord.setdefault(key, set()).add(p.name)
-        elif rname in ("ASP", "GLU") and states.get(key) in ("ASPP", "GLUP"):
+        if ring_n:
+            his_coord.setdefault(key, {}).setdefault(p.name, []).append((d, id(m)))
+        elif (rname, p.name) in (("ASP", "OD1"), ("ASP", "OD2"), ("GLU", "OE1"),
+                                 ("GLU", "OE2")) and states.get(key) in ("ASPP", "GLUP"):
             rep.info(f"{rname} {key[0]}{key[1]} coordinates {m.name}: forced "
                      "deprotonated")
             states.pop(key)
-        elif rname == "CYS":
+        elif rname == "CYS" and p.name == "SG":
             if cfg.cys_deprot_patch:
                 states[key] = cfg.cys_deprot_patch
             else:
                 rep.review(f"CYS {key[0]}{key[1]} coordinates {m.name} and should "
                            "be deprotonated; set --cys-deprot-patch for your toppar")
-    for key, ns in his_coord.items():
+    for key, by_n in his_coord.items():
+        ns = set(by_n)
+        if ns == {"ND1", "NE2"}:
+            # both N within reach: of one metal -> the nearer N binds it;
+            # of two metals -> a bridging imidazolate, which needs a decision
+            metals = {mid for lst in by_n.values() for _, mid in lst}
+            dmin = {n: min(d for d, _ in lst) for n, lst in by_n.items()}
+            if len(metals) == 1 and abs(dmin["ND1"] - dmin["NE2"]) >= 0.3:
+                ns = {min(dmin, key=dmin.get)}
         if ns == {"ND1"}:
             new = "HSE"
         elif ns == {"NE2"}:
             new = "HSD"
         else:
-            rep.review(f"HIS {key[0]}{key[1]} coordinates via both ring N")
+            rep.review(f"HIS {key[0]}{key[1]} coordinates metal ions via both ring N "
+                       "(bridging imidazolate?); tautomer left as assigned")
             continue
         if states.get(key) != new:
             rep.info(f"HIS {key[0]}{key[1]}: {states.get(key)} -> {new} "
@@ -2520,6 +2608,8 @@ def process(model, cfg):
         elif "MOLECULE DESTROYED BY FATAL ERROR" in r.stdout or \
                 re.search(r"psfgen\) ERROR", r.stdout):
             rep.review("psfgen reported errors; see build/vmd.log")
+        for line in re.findall(r"^AFPREP_WARNING: (.*)$", r.stdout, re.M):
+            rep.review(line)
     rep.write(outdir)
     return rep
 
@@ -2531,7 +2621,7 @@ def write_name_suggestions(cfg):
     from collections import defaultdict
     agg = defaultdict(lambda: [0, []])
     for m in cfg.models:
-        name = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(m).stem)
+        name = model_name(m)
         f = Path(cfg.outdir) / name / "report.json"
         if not f.exists():
             continue
@@ -2540,7 +2630,7 @@ def write_name_suggestions(cfg):
             agg[(uni_name, ccd)][1].append(name)
     params = defaultdict(list)
     for m in cfg.models:
-        name = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(m).stem)
+        name = model_name(m)
         f = Path(cfg.outdir) / name / "report.json"
         if f.exists():
             for code in json.loads(f.read_text()).get("needs_params", []):
@@ -2558,7 +2648,7 @@ def write_name_suggestions(cfg):
     # loose matches (stereo-ambiguous, analogs) found in ChEBI-mapped sites
     rel = defaultdict(lambda: [0, []])
     for m in cfg.models:
-        name = re.sub(r"[^A-Za-z0-9_.-]", "_", Path(m).stem)
+        name = model_name(m)
         f = Path(cfg.outdir) / name / "report.json"
         if f.exists():
             for uni_name, ccd, kind, n in json.loads(f.read_text()).get("related_ligands", []):
@@ -2608,6 +2698,17 @@ def _run_one(m, cfg):
                 ",".join(sorted(set(rep.data.get("needs_params", [])))))
     except Exception as exc:  # noqa: BLE001
         log.error("[%s] ERROR: %s", m, exc)
+        # replace whatever an earlier run left: a report that says what failed
+        try:
+            outdir = Path(cfg.outdir) / model_name(m)
+            outdir.mkdir(parents=True, exist_ok=True)
+            rep = Report(model_name(m))
+            rep.flags.append(("ERROR", f"{type(exc).__name__}: {exc}"))
+            rep.write(outdir)
+            write_candidates(outdir, rep)        # removes old candidate files
+            clean_build(outdir / "build", model_name(m))   # and an old build
+        except OSError:
+            pass
         return (Path(m).name, f"ERROR: {exc}", "-", "-", "")
 
 
@@ -2762,6 +2863,15 @@ def main(argv=None):
                  "(a version that writes ccd_aliases.json and uniprot_states.json)")
     if shutil.which(cfg.pdb2pqr) is None:
         sys.exit(f"pdb2pqr executable '{cfg.pdb2pqr}' not found")
+
+    seen = {}
+    for m in cfg.models:
+        seen.setdefault(model_name(m), []).append(m)
+    clash = {k: v for k, v in seen.items() if len(v) > 1}
+    if clash:
+        k, v = next(iter(clash.items()))
+        sys.exit(f"{len(clash)} output name(s) used by several input files, e.g. '{k}': "
+                 f"{', '.join(map(str, v[:3]))} - rename the files or run them separately")
 
     global HTTP_RETRIES
     HTTP_RETRIES = max(1, cfg.retries)

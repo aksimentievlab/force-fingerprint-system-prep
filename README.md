@@ -148,6 +148,13 @@ python af_prep.py filtered_dataset/filtered_mf/structures/SOME_PROTEIN.pdb \
   - `<model>_ion_box.txt`, the box size;
   - `metal_extrabonds.txt`, when the model has metal sites.
 
+**Reruns.** Each run replaces a model's earlier output:
+the build files (including an old PSF), `candidates.pdb` and the report are removed or rewritten,
+also when the model now fails.
+A model that fails with an error gets a report with status `ERROR` and the error message.
+Input files must have distinct names, since the name decides the output folder;
+`af_prep.py` stops if two inputs share one.
+
 ### 2.4 Running NAMD with the result
 
 ```tcl
@@ -272,6 +279,10 @@ Each report lists the mapping it used and how each code was found.
 
   An apo-like pocket, collapsed or opened up, fails these tests.
   At most one copy is kept per annotated site and chain.
+  A site belongs to the UniProt ligand, not to one PDB code:
+  when a ligand maps to several codes (Fe(2+): FE2/FE, NAD(+): NAD/NAI), a copy under any of them fills the site,
+  and an empty site is reported once, as e.g. "FE2/FE binding site".
+  Codes of different metals reached through a generic name ("a divalent metal cation") are not merged.
   Cofactors are selected first, so a substrate cannot take the place of the cofactor it needs.
   Copies of different ligands may not overlap (atoms closer than 2 Å);
   pairs involving a metal atom only count below 1.6 Å, since a metal bonds to ligand atoms at about 2 Å (e.g. O2 on the iron of a dioxygenase).
@@ -295,7 +306,8 @@ Each report lists the mapping it used and how each code was found.
   it is flagged REVIEW as a warning, and with Dowser++ the report says whether one of its waters reaches the ion.
   Otherwise the ion is dropped and its site flagged REVIEW, whether or not UniProt calls it a cofactor:
   the ion may be substrate-bridged.
-  Conversely, a non-cofactor ligand that coordinates the position of a metal ion that was not placed is dropped too,
+  Conversely, a small non-cofactor ligand (fewer heavy atoms than `--min-partner-atoms`, e.g. O2)
+  that coordinates the position of a metal ion that was not placed is dropped too,
   since it would bind only with the metal there.
 - **Metal sites without a usable copy.** An annotated metal site that is still empty (no copy, or every copy dropped)
   gets an ion placed from the donor atoms of its annotated residues:
@@ -371,9 +383,13 @@ Each report lists the mapping it used and how each code was found.
 - Residues with pKa near the pH are reported.
 
 **6. Metal sites and disulfides.**
-- Residues coordinating a metal are overridden: His tautomer from the coordinating nitrogen, Asp/Glu deprotonated, Cys deprotonated (`--cys-deprot-patch`, default `CYSD`).
+- Residues coordinating a metal through a side-chain atom are overridden:
+  His tautomer from the coordinating ring nitrogen (the nearer one, if both are within reach of the same ion),
+  Asp/Glu deprotonated, Cys deprotonated (`--cys-deprot-patch`, default `CYSD`).
+  A residue that only coordinates through its backbone oxygen keeps its state.
 - A His bonded to a heme iron gets the PHEM patch.
 - Metal-ligand distances are written as NAMD extraBonds restraints.
+  A restraint whose atoms are not found in the built system is skipped and flagged.
 - Disulfides are found by SG-SG distance and cross-checked against PDB2PQR's own detection.
 
 **7. Build.**
