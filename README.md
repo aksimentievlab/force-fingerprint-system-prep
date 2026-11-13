@@ -155,6 +155,69 @@ A model that fails with an error gets a report with status `ERROR` and the error
 Input files must have distinct names, since the name decides the output folder;
 `af_prep.py` stops if two inputs share one.
 
+**Manual review of empty sites.** `review_candidates.tcl` steps through the `candidates.tcl` files of a run in VMD and records one verdict per model;
+`apply_review.py` applies the verdicts and builds the reviewed models:
+
+```bash
+vmd -e review_candidates.tcl -args 1-prep 1-prep.review.tsv
+#   Control-n / Control-p: next / previous model
+#   review ok  "Nothing to do"
+#   review fix "Retain s1r1,s2r3; remove residue 168"
+#   review review "Bad GTP fit"
+python apply_review.py 1-prep.review.tsv --run 1-prep --out 1-prep-manual \
+    --inputs "filtered_dataset/filtered_mf/structures/*.pdb" \
+    -- --outdir 2-prep --toppar ./toppar --solvate --run-vmd -j 16
+```
+
+- **Verdicts.** `OK` accepts the model as built, `FIX` applies the details, `REVIEW` (or anything else) is left for another look.
+  Details are written as typed, tabs included.
+  The VMD script skips models already in the review file, so a session can be resumed;
+  a model reviewed again gets a new line, and the last one counts.
+- **Details** are clauses separated by `;`.
+  `retain s1r1,s2r3` adds rank 1 of site 1 and rank 3 of site 2 from the reviewed run's `candidates.pdb`;
+  `remove residue 168` (or `residues 0-2,168`) removes what VMD calls residue 168 in the reviewed run's `prepped.pdb`,
+  the molecule `candidates.tcl` loads first:
+  VMD's 0-based residue index, which is unique (protein residues first, then the kept ligands).
+  A ligand is removed as such; a protein residue must be at a chain end and gets a cap where needed.
+  `remove resid 168` (or `A168`) does the same by VMD's `resid`, and holds the model back if a protein residue and a ligand share it;
+  `remove ligand NDP` removes all kept copies of a code.
+  Other text is a note;
+  a clause that starts with an instruction verb the script cannot apply (`add extrabonds ...`) holds the model back,
+  unless it ends with `?` or `--lenient` is given.
+- **The build.** Everything after `--` is passed to `af_prep.py`, whose pipeline `apply_review.py` imports and runs for the reviewed models;
+  `af_prep.py` itself is unchanged, and a plain `af_prep.py` run knows nothing of the review.
+  Without `--`, `apply_review.py` only checks the review file and writes its decisions to `--out`.
+  The pipeline is extended for the reviewed models:
+  it removes the listed ligands (matched by chain, number and code, or else as a copy of the same code within 2 Å of its reviewed position),
+  adds the retained candidates at their reviewed positions, replacing any automatically kept ligand in the same space,
+  and removes the residues.
+  Removing an internal residue is refused and flagged, since psfgen would bond across the gap.
+  The REVIEW items raised while mapping and selecting ligands, which are what the reviewer looked at, become INFO lines marked `[reviewed]`;
+  every other REVIEW item stays.
+  Site and rank numbers refer to the reviewed run, so always pass that run's folder as `--run`.
+
+**Comparing two versions.** `compare_runs.py` compares the output folders of two runs, e.g. before and after a change to `af_prep.py`:
+
+```bash
+python compare_runs.py 1-prep-old 1-prep-new        # models OK in both runs
+python compare_runs.py 1-prep-old 1-prep-new --all  # every model in both runs
+```
+
+- **Composition:** protein residues per chain, ligands by PDB code, internal waters, termini,
+  protonation states, disulfides, and atom count and net charge of the vacuum PSF.
+- **Placement:** the second run's model is superposed on the first by their shared C-alpha atoms;
+  ligand copies are then paired per PDB code, with the RMSD over shared atom names and the centroid shift.
+  A copy that changed code in place (FE -> FE2) counts as a code change.
+- **Output** in `compare_<A>_vs_<B>/`:
+  `models.tsv` (one line per model), `ligands.tsv` (one line per ligand copy) and `summary.txt`.
+  `--shift` (0.5 Å) sets the RMSD above which a ligand counts as moved.
+- **Dowser++ waters** are placed non-deterministically, so reruns often differ only in them.
+  Each model gets a category:
+  `unchanged`; `waters only` (the water count differs, and the PSF by 3 atoms per water);
+  `waters + protonation` (protonation states differ as well, likely because PDB2PQR optimizes hydrogen bonds with the waters present);
+  or `changed`.
+  `--ignore-waters` counts `waters only` as unchanged; `waters + protonation` stays visible, since those are real differences.
+
 ### 2.4 Running NAMD with the result
 
 ```tcl
