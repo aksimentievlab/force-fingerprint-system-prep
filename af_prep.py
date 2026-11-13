@@ -1652,19 +1652,40 @@ def trim_protein(protein, plddt, uni, cfg, rep):
                 continue
             conf = [plddt.get((ch, nums[i]), 100.0) >= cfg.plddt for i in idx]
             w = cfg.trim_window
-            first = next((j for j in range(len(idx)) if all(conf[j:j + w])), 0)
-            last = next((j for j in range(len(idx) - 1, -1, -1)
-                         if all(conf[max(0, j - w + 1):j + 1])), len(idx) - 1)
-            keep = idx[first:last + 1]
+            # ordered core: from the first to the last window of w confident residues
+            core0 = next((j for j in range(len(idx)) if all(conf[j:j + w])), 0)
+            core1 = next((j for j in range(len(idx) - 1, -1, -1)
+                          if all(conf[max(0, j - w + 1):j + 1])), len(idx) - 1)
+            n_tail, c_tail = core0, len(idx) - 1 - core1
+
+            def cut(tail):
+                """Residues removed from a disordered tail: none below
+                --min-tail-trim, otherwise all but --keep-tail next to the core."""
+                return 0 if tail < cfg.min_tail_trim else max(0, tail - cfg.keep_tail)
+
+            n_cut, c_cut = cut(n_tail), cut(c_tail)
+            keep = idx[n_cut:len(idx) - c_cut]
             n0, n1 = nums[keep[0]], nums[keep[-1]]
             n_native, c_native = n0 == lo, n1 == hi
             tag = f"chain {seg_ch}" + (f" (residues {lo}-{hi} of chain {ch})"
                                        if len(spans) > 1 else "")
-            if not n_native:
-                rep.info(f"{tag}: N-terminus trimmed to {n0} by pLDDT -> ACE cap")
-            if not c_native:
-                rep.info(f"{tag}: C-terminus trimmed to {n1} by pLDDT -> CT3 cap")
-            low = [nums[i] for i in keep if plddt.get((ch, nums[i]), 100) < cfg.plddt]
+            for end, tail, ncut, native, at, cap in (
+                    ("N", n_tail, n_cut, n_native, n0, "ACE"),
+                    ("C", c_tail, c_cut, c_native, n1, "CT3")):
+                if ncut:
+                    rep.info(f"{tag}: {end}-terminal disordered tail of {tail} residues "
+                             f"(pLDDT < {cfg.plddt}) "
+                             + (f"trimmed to {tail - ncut}" if tail > ncut else "removed")
+                             + f", {end}-terminus now {at} -> {cap} cap")
+                elif tail:
+                    rep.info(f"{tag}: {end}-terminal disordered tail of {tail} residues "
+                             f"kept" + (f" (shorter than {cfg.min_tail_trim})"
+                                        if tail < cfg.min_tail_trim else ""))
+                if not native and not ncut:
+                    rep.info(f"{tag}: model {'starts' if end == 'N' else 'ends'} at {at}, "
+                             f"inside the mature chain ({lo}-{hi}) -> {cap} cap")
+            low = [nums[i] for i in idx[core0:core1 + 1]
+                   if plddt.get((ch, nums[i]), 100) < cfg.plddt]
             if low:
                 rep.info(f"{tag}: {len(low)} internal residues below pLDDT "
                          f"{cfg.plddt} kept")
@@ -2776,7 +2797,12 @@ def main(argv=None):
     p.add_argument("--chain-interface-frac", type=float, default=0.5,
                    help="mature chains count as one protein if linked by a disulfide or if "
                         "this fraction of the smaller chain's residues touch the other")
-    p.add_argument("--trim-window", type=int, default=3)
+    p.add_argument("--trim-window", type=int, default=3,
+                   help="confident residues in a row that mark the start of the ordered core")
+    p.add_argument("--keep-tail", type=int, default=3,
+                   help="residues of a disordered terminal tail kept next to the ordered core")
+    p.add_argument("--min-tail-trim", type=int, default=5,
+                   help="disordered terminal tails shorter than this are kept whole")
     p.add_argument("--clash", type=float, default=2.2)
     p.add_argument("--metal-clash", type=float, default=1.6)
     p.add_argument("--max-clash", type=int, default=3,
@@ -2849,6 +2875,8 @@ def main(argv=None):
                    help="models processed in parallel (Dowser++ uses one core per model)")
     p.add_argument("-v", "--verbose", action="store_true")
     cfg = p.parse_args(argv)
+    if cfg.keep_tail < 0 or cfg.min_tail_trim < 1:
+        sys.exit("--keep-tail must be >= 0 and --min-tail-trim >= 1")
     cfg.keep_ligands = {s.strip().upper() for s in cfg.keep_ligands.split(",") if s.strip()}
     try:
         cfg.name_map = dict((k.strip(), [c.strip().upper() for c in v.split(",")

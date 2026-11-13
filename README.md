@@ -360,7 +360,13 @@ Each report lists the mapping it used and how each code was found.
   - Otherwise the protein is likely a polyprotein of independent products:
   no mature boundaries are applied and the model is flagged REVIEW, so you can choose the product to simulate.
   - `report.json` lists the segments under `segments`.
-- Disordered termini are trimmed by pLDDT (`--plddt`, `--trim-window`).
+- Disordered terminal tails are trimmed by pLDDT.
+  The ordered core starts and ends with `--trim-window` (3) residues in a row at pLDDT >= `--plddt` (50);
+  residues outside it form the disordered tails.
+  A tail shorter than `--min-tail-trim` (5) is kept whole;
+  a longer one is cut to the `--keep-tail` (3) residues next to the core,
+  so a 6-residue tail loses 3 residues and a 20-residue tail loses 17.
+  `--keep-tail 0` cuts tails back to the core.
 - Residue numbering stays UniProt numbering.
 - Native termini get NTER/CTER (PROP/GLYP for an N-terminal Pro/Gly).
   Termini created by trimming get neutral caps, ACE/ACP and CT3.
@@ -495,6 +501,8 @@ Each report lists the mapping it used and how each code was found.
 | Option | Default | Meaning |
 |---|---|---|
 | `--plddt`, `--trim-window` | 50, 3 | terminal trimming threshold and window |
+| `--keep-tail` | 3 | residues of a disordered terminal tail kept next to the ordered core |
+| `--min-tail-trim` | 5 | disordered terminal tails shorter than this are kept whole |
 | `--main-chain-frac` | 0.8 | fraction of the mature residues the kept chains must hold before unlinked chains are dropped |
 | `--chain-interface-frac` | 0.5 | mature chains count as linked if this fraction of the smaller chain's residues touch the other |
 | `--min-chain-interface-len` | 30 | shorter mature chains count as linked only through a disulfide |
