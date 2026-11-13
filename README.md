@@ -371,6 +371,9 @@ Each report lists the mapping it used and how each code was found.
 - Each model runs in its own temporary copy of the Dowser++ folder, so `-j` is safe.
 - Waters overlapping protein, cofactors or each other are dropped.
   The rest are renumbered in chain W.
+- A run that exits normally after reaching Dowser++'s final stages but writes no water file
+  means that no water passed its energy cutoff: zero internal waters, reported as INFO.
+  Runs that exit with an error or stop earlier are flagged REVIEW.
 
 **5. Protonation.**
 - PDB2PQR with PROPKA, at `--ph`.
@@ -447,7 +450,7 @@ Each report lists the mapping it used and how each code was found.
 | annotated cofactor not placed / cofactor binding site left empty | AlphaFill had no copy that fits the model's pocket (the reason is given); consider a homolog structure or co-folding |
 | UniProt suggests a state that isn't available | the cofactor was built from its PDB code; check its charge/redox state |
 | covalent cofactor/modification | needs a custom patch (e.g. PLP-Lys) |
-| Dowser++ failed | see `dowser/*.log`; the model is built without internal waters |
+| Dowser++ failed | it exited with an error or stopped before its final stages; see `dowser/*.log`; the model is built without internal waters |
 | psfgen reported errors | see `build/vmd.log` |
 
 ### Options

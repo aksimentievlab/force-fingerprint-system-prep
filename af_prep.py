@@ -1696,6 +1696,11 @@ DOWSER_TEMP = re.compile(r"^(box.*\.txt|config\.txt|AllSets\.pdb|AllScores\.txt|
                          r"dpp\.log)$")
 
 
+# Log lines of Dowser's final stages (reform/placeWat/choosing): a run that
+# exits normally after printing them has finished, even without an output file.
+DOWSER_FINISHED = ("Reformatted and extended pdb file", "DOWSER - default")
+
+
 def stage_dowser(src, dst, link):
     for root, _, files in os.walk(src):
         d = Path(dst) / os.path.relpath(root, src)
@@ -1757,6 +1762,11 @@ def run_dowser(protein, lig_atoms, outdir, cfg, rep):
             else:   # new .pdb files that contain waters
                 outs = [p for p in work.iterdir() if p.suffix == ".pdb"
                         and p.name not in before and _dowser_waters(p)]
+            if rc == 0 and not any(_dowser_waters(p) for p in outs) and \
+                    any(m in log_txt for m in DOWSER_FINISHED):
+                # ran to its final stages, but no water passed its energy cutoff:
+                # the last step then writes no (or an empty) file
+                return [], mins, "no waters"
             if rc != 0 or not outs:
                 return None, mins, f"exit code {rc}, no output file"
             out = max(outs, key=lambda p: p.stat().st_mtime)
@@ -1784,6 +1794,10 @@ def run_dowser(protein, lig_atoms, outdir, cfg, rep):
         return []
     if what == "none":
         rep.info(f"Dowser++: no buried cavities, no internal waters ({mins:.1f} min)")
+        return []
+    if what == "no waters":
+        rep.info(f"Dowser++: finished, but no internal water passed its energy cutoff "
+                 f"({mins:.1f} min)")
         return []
 
     # drop waters overlapping protein/cofactors or each other
